@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { Menu } from 'lucide-react';
 import { LoginPage } from './pages/LoginPage';
-import { ProtectedRoute } from './components/ProtectedRoute';
+import { ProtectedRoute } from './components/protectedRoute';
 import { Sidebar } from './components/Sidebar';
 import { Dashboard } from './components/Dashboard';
 import { AnggotaPage } from './pages/AnggotaPage';
