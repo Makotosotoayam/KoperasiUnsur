@@ -32,7 +32,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
         <>
             <div className="p-6 flex items-center justify-between gap-3 border-b border-gray-200">
                 <div className="flex items-center gap-3">
-                    <img src="/public/koperasi.svg" alt="Logo Unsur" className="w-15 h-15 object-contain" />
+                    <img src="/public/koperasi.svg" alt="Logo Unsur" className="w-14 h-14 object-contain" />
                     <div className="font-bold text-lg leading-tight text-emerald-900">
                         Koperasi<br />Kesejahteraan<br />Universitas
                     </div>
