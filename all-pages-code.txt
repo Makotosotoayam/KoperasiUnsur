@@ -1,0 +1,3115 @@
+﻿
+
+===== src\pages\SimpananPage.tsx =====
+import { useCallback, useEffect, useState } from 'react';
+import { Search } from 'lucide-react';
+import { supabase } from '../supabaseClient';
+import { PageHeader } from '../components/ui/PageHeader';
+import { Modal, FormField, FormActions, inputClass, selectClass } from '../components/ui/Modal';
+import { ActionButtons, EmptyState, ErrorState, LoadingState, Pagination } from '../components/ui/TableHelpers';
+import { SearchableSelect } from '../components/ui/SearchableSelect';
+import { formatIDR } from '../utils';
+
+const MONTHS = [
+    'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
+    'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember',
+];
+
+interface AnggotaOption {
+    id: number;
+    no_kku: string;
+    nama: string;
+}
+
+interface UnitOption {
+    id: number;
+    nama_unit: string;
+}
+
+interface SimpananRow {
+    id: number;
+    id_anggota: number;
+    bulan: number;
+    tahun: number;
+    simwa: number;
+    sukarela: number;
+    anggota: (AnggotaOption & { id_unit: number | null; unit_kerja: UnitOption | null }) | null;
+}
+
+const PAGE_SIZE = 20;
+
+const emptyForm = {
+    id_anggota: '',
+    bulan: new Date().getMonth() + 1,
+    tahun: 2025,
+    simwa: '0',
+    sukarela: '0',
+};
+
+export function SimpananPage() {
+    const [anggotaOptions, setAnggotaOptions] = useState<AnggotaOption[]>([]);
+    const [units, setUnits] = useState<UnitOption[]>([]);
+    const [items, setItems] = useState<SimpananRow[]>([]);
+    const [page, setPage] = useState(1);
+    const [total, setTotal] = useState(0);
+    const [search, setSearch] = useState('');
+    const [filterTahun, setFilterTahun] = useState(2025);
+    const [filterBulan, setFilterBulan] = useState<number | ''>('');
+    const [filterUnit, setFilterUnit] = useState<number | ''>('');
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
+    const [modalOpen, setModalOpen] = useState(false);
+    const [editing, setEditing] = useState<SimpananRow | null>(null);
+    const [form, setForm] = useState(emptyForm);
+    const [saving, setSaving] = useState(false);
+
+    const lastPage = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+    useEffect(() => {
+        supabase.from('anggota').select('id, no_kku, nama').order('nama')
+            .then(({ data }) => setAnggotaOptions(data ?? []));
+        supabase.from('unit_kerja').select('id, nama_unit').order('nama_unit')
+            .then(({ data }) => setUnits(data ?? []));
+    }, []);
+
+    const load = useCallback(async () => {
+        setLoading(true);
+        setError(null);
+        try {
+            const from = (page - 1) * PAGE_SIZE;
+            const to = from + PAGE_SIZE - 1;
+
+            let matchedAnggotaIds: number[] | null = null;
+            if (search) {
+                const { data: matches } = await supabase
+                    .from('anggota')
+                    .select('id')
+                    .or(`nama.ilike.%${search}%,no_kku.ilike.%${search}%`);
+                matchedAnggotaIds = (matches ?? []).map((m) => m.id);
+                if (matchedAnggotaIds.length === 0) {
+                    setItems([]);
+                    setTotal(0);
+                    setLoading(false);
+                    return;
+                }
+            }
+
+            let query = supabase
+                .from('transaksi_potongan')
+                .select('id, id_anggota, bulan, tahun, simwa, sukarela, anggota!inner(id, no_kku, nama, id_unit, unit_kerja(id, nama_unit))', { count: 'exact' })
+                .eq('tahun', filterTahun)
+                .order('bulan')
+                .order('nama', { referencedTable: 'anggota' })
+                .range(from, to);
+
+            if (filterBulan !== '') {
+                query = query.eq('bulan', filterBulan);
+            }
+            if (filterUnit !== '') {
+                query = query.eq('anggota.id_unit', filterUnit);
+            }
+            if (matchedAnggotaIds) {
+                query = query.in('id_anggota', matchedAnggotaIds);
+            }
+
+            const { data, count, error: err } = await query;
+            if (err) throw err;
+
+            const rows = (data as any) as SimpananRow[];
+
+            setItems(rows ?? []);
+            setTotal(count ?? 0);
+        } catch (err) {
+            console.error(err);
+            setError('Gagal memuat data simpanan');
+        } finally {
+            setLoading(false);
+        }
+    }, [page, search, filterTahun, filterBulan, filterUnit]);
+
+    useEffect(() => { load(); }, [load]);
+
+    const openCreate = () => {
+        setEditing(null);
+        setForm({ ...emptyForm, tahun: filterTahun, bulan: filterBulan || new Date().getMonth() + 1 });
+        setModalOpen(true);
+    };
+
+    const openEdit = (item: SimpananRow) => {
+        setEditing(item);
+        setForm({
+            id_anggota: item.id_anggota.toString(),
+            bulan: item.bulan,
+            tahun: item.tahun,
+            simwa: String(item.simwa),
+            sukarela: String(item.sukarela),
+        });
+        setModalOpen(true);
+    };
+
+    const handleSubmit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setSaving(true);
+        try {
+            const id_anggota = Number(form.id_anggota);
+            const simwa = Number(form.simwa) || 0;
+            const sukarela = Number(form.sukarela) || 0;
+
+            if (editing) {
+                const { error: err } = await supabase
+                    .from('transaksi_potongan')
+                    .update({ simwa, sukarela })
+                    .eq('id', editing.id);
+                if (err) throw err;
+            } else {
+                // Check if a row already exists for this member+month+year
+                // (row may already hold pinjaman/pengeluaran data â€” update it, don't duplicate).
+                const { data: existing } = await supabase
+                    .from('transaksi_potongan')
+                    .select('id')
+                    .eq('id_anggota', id_anggota)
+                    .eq('bulan', form.bulan)
+                    .eq('tahun', form.tahun)
+                    .maybeSingle();
+
+                if (existing) {
+                    const { error: err } = await supabase
+                        .from('transaksi_potongan')
+                        .update({ simwa, sukarela })
+                        .eq('id', existing.id);
+                    if (err) throw err;
+                } else {
+                    const { error: err } = await supabase
+                        .from('transaksi_potongan')
+                        .insert({ id_anggota, bulan: form.bulan, tahun: form.tahun, simwa, sukarela });
+                    if (err) throw err;
+                }
+            }
+
+            setModalOpen(false);
+            load();
+        } catch (err) {
+            console.error(err);
+            alert('Gagal menyimpan data simpanan');
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    const handleDelete = async (item: SimpananRow) => {
+        if (!confirm(`Kosongkan data simpanan ${item.anggota?.nama} untuk ${MONTHS[item.bulan - 1]} ${item.tahun}? (Data pinjaman/pengeluaran bulan ini tidak akan terhapus)`)) return;
+        try {
+            // Only zero out simwa/sukarela â€” this row may still hold pinjaman/pengeluaran data.
+            const { error: err } = await supabase
+                .from('transaksi_potongan')
+                .update({ simwa: 0, sukarela: 0 })
+                .eq('id', item.id);
+            if (err) throw err;
+            load();
+        } catch (err) {
+            console.error(err);
+            alert('Gagal menghapus data simpanan');
+        }
+    };
+
+    return (
+        <div className="p-6 max-w-7xl mx-auto">
+            <PageHeader title="Simpanan" description="Simpanan wajib (SIMWA) & sukarela anggota koperasi" actionLabel="Tambah Simpanan" onAction={openCreate}>
+                <div className="flex gap-2 items-center">
+                    <select className={selectClass} value={filterTahun} onChange={(e) => { setFilterTahun(Number(e.target.value)); setPage(1); }}>
+                        <option value={2025}>2025</option>
+                        <option value={2026}>2026</option>
+                    </select>
+                    <select className={selectClass} value={filterBulan} onChange={(e) => { setFilterBulan(e.target.value ? Number(e.target.value) : ''); setPage(1); }}>
+                        <option value="">Semua Bulan</option>
+                        {MONTHS.map((m, i) => (
+                            <option key={i} value={i + 1}>{m}</option>
+                        ))}
+                    </select>
+                    <select className={selectClass} value={filterUnit} onChange={(e) => { setFilterUnit(e.target.value ? Number(e.target.value) : ''); setPage(1); }}>
+                        <option value="">Semua Fakultas</option>
+                        {units.map((u) => (
+                            <option key={u.id} value={u.id}>{u.nama_unit}</option>
+                        ))}
+                    </select>
+                    <div className="relative">
+                        <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+                        <input
+                            type="text"
+                            placeholder="Cari anggota..."
+                            value={search}
+                            onChange={(e) => { setSearch(e.target.value); setPage(1); }}
+                            className="pl-9 pr-3 py-2 border border-gray-300 rounded-lg text-sm w-56"
+                        />
+                    </div>
+                </div>
+            </PageHeader>
+
+            <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
+                {loading ? <LoadingState /> : error ? <ErrorState message={error} /> : items.length === 0 ? (
+                    <EmptyState message="Belum ada data simpanan untuk periode ini" />
+                ) : (
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-left">
+                            <thead>
+                                <tr className="bg-gray-50 border-b border-gray-100">
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase">Bulan</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase">Anggota</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase">Fakultas</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase text-right">SIMWA</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase text-right">Sukarela</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase text-right">Total</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase text-right">Aksi</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-100">
+                                {items.map((item) => (
+                                    <tr key={item.id} className="hover:bg-gray-50/50">
+                                        <td className="py-3 px-6 text-sm text-gray-600">{MONTHS[item.bulan - 1]} {item.tahun}</td>
+                                        <td className="py-3 px-6 text-sm text-gray-900">{item.anggota?.nama ?? '-'} <span className="text-gray-400">({item.anggota?.no_kku})</span></td>
+                                        <td className="py-3 px-6 text-sm text-gray-600">{item.anggota?.unit_kerja?.nama_unit ?? '-'}</td>
+                                        <td className="py-3 px-6 text-sm text-gray-700 text-right">{formatIDR(Number(item.simwa))}</td>
+                                        <td className="py-3 px-6 text-sm text-gray-700 text-right">{formatIDR(Number(item.sukarela))}</td>
+                                        <td className="py-3 px-6 text-sm font-medium text-gray-900 text-right">{formatIDR(Number(item.simwa) + Number(item.sukarela))}</td>
+                                        <td className="py-3 px-6"><ActionButtons onEdit={() => openEdit(item)} onDelete={() => handleDelete(item)} /></td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                )}
+                <Pagination currentPage={page} lastPage={lastPage} total={total} onPageChange={setPage} />
+            </div>
+
+            <Modal open={modalOpen} title={editing ? 'Edit Simpanan' : 'Tambah Simpanan'} onClose={() => setModalOpen(false)}>
+                <form onSubmit={handleSubmit}>
+                    <FormField label="Anggota" required>
+                        <SearchableSelect
+                            disabled={!!editing}
+                            value={form.id_anggota}
+                            onChange={(v) => setForm({ ...form, id_anggota: v })}
+                            placeholder="Cari nama / no KKU..."
+                            options={anggotaOptions.map((a) => ({ value: String(a.id), label: `${a.no_kku} â€” ${a.nama}` }))}
+                        />
+                    </FormField>
+                    <FormField label="Bulan" required>
+                        <select className={selectClass} disabled={!!editing} value={form.bulan} onChange={(e) => setForm({ ...form, bulan: Number(e.target.value) })}>
+                            {MONTHS.map((m, i) => (
+                                <option key={i} value={i + 1}>{m}</option>
+                            ))}
+                        </select>
+                    </FormField>
+                    <FormField label="Tahun" required>
+                        <input type="number" className={inputClass} disabled={!!editing} required value={form.tahun} onChange={(e) => setForm({ ...form, tahun: Number(e.target.value) })} />
+                    </FormField>
+                    <FormField label="SIMWA (Rp)" required>
+                        <input type="number" min="0" className={inputClass} required value={form.simwa} onChange={(e) => setForm({ ...form, simwa: e.target.value })} />
+                    </FormField>
+                    <FormField label="Sukarela (Rp)">
+                        <input type="number" min="0" className={inputClass} value={form.sukarela} onChange={(e) => setForm({ ...form, sukarela: e.target.value })} />
+                    </FormField>
+                    <FormActions onCancel={() => setModalOpen(false)} saving={saving} />
+                </form>
+            </Modal>
+        </div>
+    );
+}
+
+
+===== src\pages\PinjamanPage.tsx =====
+import { useCallback, useEffect, useState } from 'react';
+import { Search } from 'lucide-react';
+import { supabase } from '../supabaseClient';
+import { PageHeader } from '../components/ui/PageHeader';
+import { Modal, FormField, FormActions, inputClass, selectClass } from '../components/ui/Modal';
+import { ActionButtons, EmptyState, ErrorState, LoadingState, Pagination } from '../components/ui/TableHelpers';
+import { SearchableSelect } from '../components/ui/SearchableSelect';
+import { formatIDR } from '../utils';
+
+const MONTHS = [
+    'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
+    'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember',
+];
+
+interface AnggotaOption {
+    id: number;
+    no_kku: string;
+    nama: string;
+}
+
+interface UnitOption {
+    id: number;
+    nama_unit: string;
+}
+
+interface PinjamanRow {
+    id: number;
+    id_anggota: number;
+    bulan: number;
+    tahun: number;
+    pokok: number;
+    jasa: number;
+    cicilan_ke: string | null;
+    anggota: (AnggotaOption & { id_unit: number | null; unit_kerja: UnitOption | null }) | null;
+}
+
+const PAGE_SIZE = 20;
+
+const emptyForm = {
+    id_anggota: '',
+    bulan: new Date().getMonth() + 1,
+    tahun: 2025,
+    pokok: '0',
+    jasa: '0',
+    cicilan_ke: '',
+};
+
+export function PinjamanPage() {
+    const [anggotaOptions, setAnggotaOptions] = useState<AnggotaOption[]>([]);
+    const [units, setUnits] = useState<UnitOption[]>([]);
+    const [items, setItems] = useState<PinjamanRow[]>([]);
+    const [page, setPage] = useState(1);
+    const [total, setTotal] = useState(0);
+    const [search, setSearch] = useState('');
+    const [filterTahun, setFilterTahun] = useState(2025);
+    const [filterBulan, setFilterBulan] = useState<number | ''>('');
+    const [filterUnit, setFilterUnit] = useState<number | ''>('');
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
+    const [modalOpen, setModalOpen] = useState(false);
+    const [editing, setEditing] = useState<PinjamanRow | null>(null);
+    const [form, setForm] = useState(emptyForm);
+    const [saving, setSaving] = useState(false);
+
+    const lastPage = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+    useEffect(() => {
+        supabase.from('anggota').select('id, no_kku, nama').order('nama')
+            .then(({ data }) => setAnggotaOptions(data ?? []));
+        supabase.from('unit_kerja').select('id, nama_unit').order('nama_unit')
+            .then(({ data }) => setUnits(data ?? []));
+    }, []);
+
+    const load = useCallback(async () => {
+        setLoading(true);
+        setError(null);
+        try {
+            const from = (page - 1) * PAGE_SIZE;
+            const to = from + PAGE_SIZE - 1;
+
+            // Only rows where pokok or jasa is nonzero â€” a "pinjaman" record
+            // for this view means an actual loan deduction happened that month.
+            let matchedAnggotaIds: number[] | null = null;
+            if (search) {
+                const { data: matches } = await supabase
+                    .from('anggota')
+                    .select('id')
+                    .or(`nama.ilike.%${search}%,no_kku.ilike.%${search}%`);
+                matchedAnggotaIds = (matches ?? []).map((m) => m.id);
+                if (matchedAnggotaIds.length === 0) {
+                    setItems([]);
+                    setTotal(0);
+                    setLoading(false);
+                    return;
+                }
+            }
+
+            let query = supabase
+                .from('transaksi_potongan')
+                .select('id, id_anggota, bulan, tahun, pokok, jasa, cicilan_ke, anggota!inner(id, no_kku, nama, id_unit, unit_kerja(id, nama_unit))', { count: 'exact' })
+                .eq('tahun', filterTahun)
+                .or('pokok.gt.0,jasa.gt.0')
+                .order('bulan')
+                .order('nama', { referencedTable: 'anggota' })
+                .range(from, to);
+
+            if (filterBulan !== '') {
+                query = query.eq('bulan', filterBulan);
+            }
+            if (filterUnit !== '') {
+                query = query.eq('anggota.id_unit', filterUnit);
+            }
+            if (matchedAnggotaIds) {
+                query = query.in('id_anggota', matchedAnggotaIds);
+            }
+
+            const { data, count, error: err } = await query;
+            if (err) throw err;
+
+            const rows = (data as any) as PinjamanRow[];
+
+            setItems(rows ?? []);
+            setTotal(count ?? 0);
+        } catch (err) {
+            console.error(err);
+            setError('Gagal memuat data pinjaman');
+        } finally {
+            setLoading(false);
+        }
+    }, [page, search, filterTahun, filterBulan, filterUnit]);
+
+    useEffect(() => { load(); }, [load]);
+
+    const openCreate = () => {
+        setEditing(null);
+        setForm({ ...emptyForm, tahun: filterTahun, bulan: filterBulan || new Date().getMonth() + 1 });
+        setModalOpen(true);
+    };
+
+    const openEdit = (item: PinjamanRow) => {
+        setEditing(item);
+        setForm({
+            id_anggota: item.id_anggota.toString(),
+            bulan: item.bulan,
+            tahun: item.tahun,
+            pokok: String(item.pokok),
+            jasa: String(item.jasa),
+            cicilan_ke: item.cicilan_ke ?? '',
+        });
+        setModalOpen(true);
+    };
+
+    const handleSubmit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setSaving(true);
+        try {
+            const id_anggota = Number(form.id_anggota);
+            const pokok = Number(form.pokok) || 0;
+            const jasa = Number(form.jasa) || 0;
+            const cicilan_ke = form.cicilan_ke || null;
+
+            if (editing) {
+                const { error: err } = await supabase
+                    .from('transaksi_potongan')
+                    .update({ pokok, jasa, cicilan_ke })
+                    .eq('id', editing.id);
+                if (err) throw err;
+            } else {
+                const { data: existing } = await supabase
+                    .from('transaksi_potongan')
+                    .select('id')
+                    .eq('id_anggota', id_anggota)
+                    .eq('bulan', form.bulan)
+                    .eq('tahun', form.tahun)
+                    .maybeSingle();
+
+                if (existing) {
+                    const { error: err } = await supabase
+                        .from('transaksi_potongan')
+                        .update({ pokok, jasa, cicilan_ke })
+                        .eq('id', existing.id);
+                    if (err) throw err;
+                } else {
+                    const { error: err } = await supabase
+                        .from('transaksi_potongan')
+                        .insert({ id_anggota, bulan: form.bulan, tahun: form.tahun, pokok, jasa, cicilan_ke });
+                    if (err) throw err;
+                }
+            }
+
+            setModalOpen(false);
+            load();
+        } catch (err) {
+            console.error(err);
+            alert('Gagal menyimpan data pinjaman');
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    const handleDelete = async (item: PinjamanRow) => {
+        if (!confirm(`Kosongkan data pinjaman ${item.anggota?.nama} untuk ${MONTHS[item.bulan - 1]} ${item.tahun}? (Data simpanan/pengeluaran bulan ini tidak akan terhapus)`)) return;
+        try {
+            // Only clear pokok/jasa/cicilan_ke â€” this row may still hold simpanan/pengeluaran data.
+            const { error: err } = await supabase
+                .from('transaksi_potongan')
+                .update({ pokok: 0, jasa: 0, cicilan_ke: null })
+                .eq('id', item.id);
+            if (err) throw err;
+            load();
+        } catch (err) {
+            console.error(err);
+            alert('Gagal menghapus data pinjaman');
+        }
+    };
+
+    return (
+        <div className="p-6 max-w-7xl mx-auto">
+            <PageHeader title="Pinjaman" description="Angsuran pokok & jasa pinjaman anggota (per bulan)" actionLabel="Tambah Pinjaman" onAction={openCreate}>
+                <div className="flex gap-2 items-center">
+                    <select className={selectClass} value={filterTahun} onChange={(e) => { setFilterTahun(Number(e.target.value)); setPage(1); }}>
+                        <option value={2025}>2025</option>
+                        <option value={2026}>2026</option>
+                    </select>
+                    <select className={selectClass} value={filterBulan} onChange={(e) => { setFilterBulan(e.target.value ? Number(e.target.value) : ''); setPage(1); }}>
+                        <option value="">Semua Bulan</option>
+                        {MONTHS.map((m, i) => (
+                            <option key={i} value={i + 1}>{m}</option>
+                        ))}
+                    </select>
+                    <select className={selectClass} value={filterUnit} onChange={(e) => { setFilterUnit(e.target.value ? Number(e.target.value) : ''); setPage(1); }}>
+                        <option value="">Semua Fakultas</option>
+                        {units.map((u) => (
+                            <option key={u.id} value={u.id}>{u.nama_unit}</option>
+                        ))}
+                    </select>
+                    <div className="relative">
+                        <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+                        <input
+                            type="text"
+                            placeholder="Cari anggota..."
+                            value={search}
+                            onChange={(e) => { setSearch(e.target.value); setPage(1); }}
+                            className="pl-9 pr-3 py-2 border border-gray-300 rounded-lg text-sm w-56"
+                        />
+                    </div>
+                </div>
+            </PageHeader>
+
+            <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
+                {loading ? <LoadingState /> : error ? <ErrorState message={error} /> : items.length === 0 ? (
+                    <EmptyState message="Belum ada data pinjaman untuk periode ini" />
+                ) : (
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-left">
+                            <thead>
+                                <tr className="bg-gray-50 border-b border-gray-100">
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase">Bulan</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase">Anggota</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase">Fakultas</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase">Cicilan Ke</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase text-right">Pokok</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase text-right">Jasa</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase text-right">Total</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase text-right">Aksi</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-100">
+                                {items.map((item) => (
+                                    <tr key={item.id} className="hover:bg-gray-50/50">
+                                        <td className="py-3 px-6 text-sm text-gray-600">{MONTHS[item.bulan - 1]} {item.tahun}</td>
+                                        <td className="py-3 px-6 text-sm text-gray-900">{item.anggota?.nama ?? '-'} <span className="text-gray-400">({item.anggota?.no_kku})</span></td>
+                                        <td className="py-3 px-6 text-sm text-gray-600">{item.anggota?.unit_kerja?.nama_unit ?? '-'}</td>
+                                        <td className="py-3 px-6 text-sm text-gray-600">{item.cicilan_ke ?? '-'}</td>
+                                        <td className="py-3 px-6 text-sm text-gray-700 text-right">{formatIDR(Number(item.pokok))}</td>
+                                        <td className="py-3 px-6 text-sm text-gray-700 text-right">{formatIDR(Number(item.jasa))}</td>
+                                        <td className="py-3 px-6 text-sm font-medium text-gray-900 text-right">{formatIDR(Number(item.pokok) + Number(item.jasa))}</td>
+                                        <td className="py-3 px-6"><ActionButtons onEdit={() => openEdit(item)} onDelete={() => handleDelete(item)} /></td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                )}
+                <Pagination currentPage={page} lastPage={lastPage} total={total} onPageChange={setPage} />
+            </div>
+
+            <Modal open={modalOpen} title={editing ? 'Edit Pinjaman' : 'Tambah Pinjaman'} onClose={() => setModalOpen(false)}>
+                <form onSubmit={handleSubmit}>
+                    <FormField label="Anggota" required>
+                        <SearchableSelect
+                            disabled={!!editing}
+                            value={form.id_anggota}
+                            onChange={(v) => setForm({ ...form, id_anggota: v })}
+                            placeholder="Cari nama / no KKU..."
+                            options={anggotaOptions.map((a) => ({ value: String(a.id), label: `${a.no_kku} â€” ${a.nama}` }))}
+                        />
+                    </FormField>
+                    <FormField label="Bulan" required>
+                        <select className={selectClass} disabled={!!editing} value={form.bulan} onChange={(e) => setForm({ ...form, bulan: Number(e.target.value) })}>
+                            {MONTHS.map((m, i) => (
+                                <option key={i} value={i + 1}>{m}</option>
+                            ))}
+                        </select>
+                    </FormField>
+                    <FormField label="Tahun" required>
+                        <input type="number" className={inputClass} disabled={!!editing} required value={form.tahun} onChange={(e) => setForm({ ...form, tahun: Number(e.target.value) })} />
+                    </FormField>
+                    <FormField label="Cicilan Ke (mis. 3/10)">
+                        <input className={inputClass} placeholder="3/10" value={form.cicilan_ke} onChange={(e) => setForm({ ...form, cicilan_ke: e.target.value })} />
+                    </FormField>
+                    <div className="grid grid-cols-2 gap-3">
+                        <FormField label="Pokok (Rp)" required>
+                            <input type="number" min="0" className={inputClass} required value={form.pokok} onChange={(e) => setForm({ ...form, pokok: e.target.value })} />
+                        </FormField>
+                        <FormField label="Jasa (Rp)">
+                            <input type="number" min="0" className={inputClass} value={form.jasa} onChange={(e) => setForm({ ...form, jasa: e.target.value })} />
+                        </FormField>
+                    </div>
+                    <FormActions onCancel={() => setModalOpen(false)} saving={saving} />
+                </form>
+            </Modal>
+        </div>
+    );
+}
+
+
+===== src\pages\PengeluaranPage.tsx =====
+import { useCallback, useEffect, useState } from 'react';
+import { Search } from 'lucide-react';
+import { supabase } from '../supabaseClient';
+import { PageHeader } from '../components/ui/PageHeader';
+import { Modal, FormField, FormActions, inputClass, selectClass } from '../components/ui/Modal';
+import { ActionButtons, EmptyState, ErrorState, LoadingState, Pagination } from '../components/ui/TableHelpers';
+import { SearchableSelect } from '../components/ui/SearchableSelect';
+import { formatIDR } from '../utils';
+
+const MONTHS = [
+    'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
+    'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember',
+];
+
+interface AnggotaOption {
+    id: number;
+    no_kku: string;
+    nama: string;
+}
+
+interface UnitOption {
+    id: number;
+    nama_unit: string;
+}
+
+interface PengeluaranRow {
+    id: number;
+    id_anggota: number;
+    bulan: number;
+    tahun: number;
+    barang: number;
+    anggota: (AnggotaOption & { id_unit: number | null; unit_kerja: UnitOption | null }) | null;
+}
+
+const PAGE_SIZE = 20;
+
+const emptyForm = {
+    id_anggota: '',
+    bulan: new Date().getMonth() + 1,
+    tahun: 2025,
+    barang: '0',
+};
+
+export function PengeluaranPage() {
+    const [anggotaOptions, setAnggotaOptions] = useState<AnggotaOption[]>([]);
+    const [units, setUnits] = useState<UnitOption[]>([]);
+    const [items, setItems] = useState<PengeluaranRow[]>([]);
+    const [page, setPage] = useState(1);
+    const [total, setTotal] = useState(0);
+    const [search, setSearch] = useState('');
+    const [filterTahun, setFilterTahun] = useState(2025);
+    const [filterBulan, setFilterBulan] = useState<number | ''>('');
+    const [filterUnit, setFilterUnit] = useState<number | ''>('');
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
+    const [modalOpen, setModalOpen] = useState(false);
+    const [editing, setEditing] = useState<PengeluaranRow | null>(null);
+    const [form, setForm] = useState(emptyForm);
+    const [saving, setSaving] = useState(false);
+
+    const lastPage = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+    useEffect(() => {
+        supabase.from('anggota').select('id, no_kku, nama').order('nama')
+            .then(({ data }) => setAnggotaOptions(data ?? []));
+        supabase.from('unit_kerja').select('id, nama_unit').order('nama_unit')
+            .then(({ data }) => setUnits(data ?? []));
+    }, []);
+
+    const load = useCallback(async () => {
+        setLoading(true);
+        setError(null);
+        try {
+            const from = (page - 1) * PAGE_SIZE;
+            const to = from + PAGE_SIZE - 1;
+
+            let matchedAnggotaIds: number[] | null = null;
+            if (search) {
+                const { data: matches } = await supabase
+                    .from('anggota')
+                    .select('id')
+                    .or(`nama.ilike.%${search}%,no_kku.ilike.%${search}%`);
+                matchedAnggotaIds = (matches ?? []).map((m) => m.id);
+                if (matchedAnggotaIds.length === 0) {
+                    setItems([]);
+                    setTotal(0);
+                    setLoading(false);
+                    return;
+                }
+            }
+
+            let query = supabase
+                .from('transaksi_potongan')
+                .select('id, id_anggota, bulan, tahun, barang, anggota!inner(id, no_kku, nama, id_unit, unit_kerja(id, nama_unit))', { count: 'exact' })
+                .eq('tahun', filterTahun)
+                .gt('barang', 0)
+                .order('bulan')
+                .order('nama', { referencedTable: 'anggota' })
+                .range(from, to);
+
+            if (filterBulan !== '') {
+                query = query.eq('bulan', filterBulan);
+            }
+            if (filterUnit !== '') {
+                query = query.eq('anggota.id_unit', filterUnit);
+            }
+            if (matchedAnggotaIds) {
+                query = query.in('id_anggota', matchedAnggotaIds);
+            }
+
+            const { data, count, error: err } = await query;
+            if (err) throw err;
+
+            const rows = (data as any) as PengeluaranRow[];
+
+            setItems(rows ?? []);
+            setTotal(count ?? 0);
+        } catch (err) {
+            console.error(err);
+            setError('Gagal memuat data pengeluaran');
+        } finally {
+            setLoading(false);
+        }
+    }, [page, search, filterTahun, filterBulan, filterUnit]);
+
+    useEffect(() => { load(); }, [load]);
+
+    const openCreate = () => {
+        setEditing(null);
+        setForm({ ...emptyForm, tahun: filterTahun, bulan: filterBulan || new Date().getMonth() + 1 });
+        setModalOpen(true);
+    };
+
+    const openEdit = (item: PengeluaranRow) => {
+        setEditing(item);
+        setForm({
+            id_anggota: item.id_anggota.toString(),
+            bulan: item.bulan,
+            tahun: item.tahun,
+            barang: String(item.barang),
+        });
+        setModalOpen(true);
+    };
+
+    const handleSubmit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setSaving(true);
+        try {
+            const id_anggota = Number(form.id_anggota);
+            const barang = Number(form.barang) || 0;
+
+            if (editing) {
+                const { error: err } = await supabase
+                    .from('transaksi_potongan')
+                    .update({ barang })
+                    .eq('id', editing.id);
+                if (err) throw err;
+            } else {
+                const { data: existing } = await supabase
+                    .from('transaksi_potongan')
+                    .select('id')
+                    .eq('id_anggota', id_anggota)
+                    .eq('bulan', form.bulan)
+                    .eq('tahun', form.tahun)
+                    .maybeSingle();
+
+                if (existing) {
+                    const { error: err } = await supabase
+                        .from('transaksi_potongan')
+                        .update({ barang })
+                        .eq('id', existing.id);
+                    if (err) throw err;
+                } else {
+                    const { error: err } = await supabase
+                        .from('transaksi_potongan')
+                        .insert({ id_anggota, bulan: form.bulan, tahun: form.tahun, barang });
+                    if (err) throw err;
+                }
+            }
+
+            setModalOpen(false);
+            load();
+        } catch (err) {
+            console.error(err);
+            alert('Gagal menyimpan data pengeluaran');
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    const handleDelete = async (item: PengeluaranRow) => {
+        if (!confirm(`Kosongkan data pengeluaran barang ${item.anggota?.nama} untuk ${MONTHS[item.bulan - 1]} ${item.tahun}? (Data simpanan/pinjaman bulan ini tidak akan terhapus)`)) return;
+        try {
+            const { error: err } = await supabase
+                .from('transaksi_potongan')
+                .update({ barang: 0 })
+                .eq('id', item.id);
+            if (err) throw err;
+            load();
+        } catch (err) {
+            console.error(err);
+            alert('Gagal menghapus data pengeluaran');
+        }
+    };
+
+    return (
+        <div className="p-6 max-w-7xl mx-auto">
+            <PageHeader title="Pengeluaran" description="Potongan barang anggota koperasi (per bulan)" actionLabel="Tambah Pengeluaran" onAction={openCreate}>
+                <div className="flex gap-2 items-center">
+                    <select className={selectClass} value={filterTahun} onChange={(e) => { setFilterTahun(Number(e.target.value)); setPage(1); }}>
+                        <option value={2025}>2025</option>
+                        <option value={2026}>2026</option>
+                    </select>
+                    <select className={selectClass} value={filterBulan} onChange={(e) => { setFilterBulan(e.target.value ? Number(e.target.value) : ''); setPage(1); }}>
+                        <option value="">Semua Bulan</option>
+                        {MONTHS.map((m, i) => (
+                            <option key={i} value={i + 1}>{m}</option>
+                        ))}
+                    </select>
+                    <select className={selectClass} value={filterUnit} onChange={(e) => { setFilterUnit(e.target.value ? Number(e.target.value) : ''); setPage(1); }}>
+                        <option value="">Semua Fakultas</option>
+                        {units.map((u) => (
+                            <option key={u.id} value={u.id}>{u.nama_unit}</option>
+                        ))}
+                    </select>
+                    <div className="relative">
+                        <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+                        <input
+                            type="text"
+                            placeholder="Cari anggota..."
+                            value={search}
+                            onChange={(e) => { setSearch(e.target.value); setPage(1); }}
+                            className="pl-9 pr-3 py-2 border border-gray-300 rounded-lg text-sm w-56"
+                        />
+                    </div>
+                </div>
+            </PageHeader>
+
+            <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
+                {loading ? <LoadingState /> : error ? <ErrorState message={error} /> : items.length === 0 ? (
+                    <EmptyState message="Belum ada data pengeluaran untuk periode ini" />
+                ) : (
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-left">
+                            <thead>
+                                <tr className="bg-gray-50 border-b border-gray-100">
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase">Bulan</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase">Anggota</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase">Fakultas</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase text-right">Barang</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase text-right">Aksi</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-100">
+                                {items.map((item) => (
+                                    <tr key={item.id} className="hover:bg-gray-50/50">
+                                        <td className="py-3 px-6 text-sm text-gray-600">{MONTHS[item.bulan - 1]} {item.tahun}</td>
+                                        <td className="py-3 px-6 text-sm text-gray-900">{item.anggota?.nama ?? '-'} <span className="text-gray-400">({item.anggota?.no_kku})</span></td>
+                                        <td className="py-3 px-6 text-sm text-gray-600">{item.anggota?.unit_kerja?.nama_unit ?? '-'}</td>
+                                        <td className="py-3 px-6 text-sm font-medium text-rose-700 text-right">{formatIDR(Number(item.barang))}</td>
+                                        <td className="py-3 px-6"><ActionButtons onEdit={() => openEdit(item)} onDelete={() => handleDelete(item)} /></td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                )}
+                <Pagination currentPage={page} lastPage={lastPage} total={total} onPageChange={setPage} />
+            </div>
+
+            <Modal open={modalOpen} title={editing ? 'Edit Pengeluaran' : 'Tambah Pengeluaran'} onClose={() => setModalOpen(false)}>
+                <form onSubmit={handleSubmit}>
+                    <FormField label="Anggota" required>
+                        <SearchableSelect
+                            disabled={!!editing}
+                            value={form.id_anggota}
+                            onChange={(v) => setForm({ ...form, id_anggota: v })}
+                            placeholder="Cari nama / no KKU..."
+                            options={anggotaOptions.map((a) => ({ value: String(a.id), label: `${a.no_kku} â€” ${a.nama}` }))}
+                        />
+                    </FormField>
+                    <FormField label="Bulan" required>
+                        <select className={selectClass} disabled={!!editing} value={form.bulan} onChange={(e) => setForm({ ...form, bulan: Number(e.target.value) })}>
+                            {MONTHS.map((m, i) => (
+                                <option key={i} value={i + 1}>{m}</option>
+                            ))}
+                        </select>
+                    </FormField>
+                    <FormField label="Tahun" required>
+                        <input type="number" className={inputClass} disabled={!!editing} required value={form.tahun} onChange={(e) => setForm({ ...form, tahun: Number(e.target.value) })} />
+                    </FormField>
+                    <FormField label="Barang (Rp)" required>
+                        <input type="number" min="0" className={inputClass} required value={form.barang} onChange={(e) => setForm({ ...form, barang: e.target.value })} />
+                    </FormField>
+                    <FormActions onCancel={() => setModalOpen(false)} saving={saving} />
+                </form>
+            </Modal>
+        </div>
+    );
+}
+
+
+===== src\pages\LaporanKeuanganPage.tsx =====
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { supabase } from '../supabaseClient';
+import { PageHeader } from '../components/ui/PageHeader';
+import { Modal, FormField, FormActions, inputClass, selectClass } from '../components/ui/Modal';
+import { ActionButtons, EmptyState, ErrorState, LoadingState, Pagination } from '../components/ui/TableHelpers';
+import { SearchableSelect } from '../components/ui/SearchableSelect';
+import { formatIDR } from '../utils';
+
+const MONTHS = [
+    'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
+    'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember',
+];
+
+type CategoryKind = 'anggota_simple' | 'pinjaman' | 'angsuran' | 'expense' | 'pengambilan';
+
+interface CategoryConfig {
+    key: string;
+    label: string;
+    table: string;
+    kind: CategoryKind;
+    amountLabel: string;
+}
+
+const CATEGORIES: CategoryConfig[] = [
+    { key: 'simpanan_pokok', label: 'Simpanan Pokok', table: 'simpanan_pokok', kind: 'anggota_simple', amountLabel: 'Jumlah (Rp)' },
+    { key: 'simpanan_khusus', label: 'Simpanan Khusus', table: 'simpanan_khusus', kind: 'anggota_simple', amountLabel: 'Jumlah (Rp)' },
+    { key: 'provisi', label: 'Provisi', table: 'provisi', kind: 'anggota_simple', amountLabel: 'Jumlah (Rp)' },
+    { key: 'asuransi', label: 'Asuransi', table: 'asuransi', kind: 'anggota_simple', amountLabel: 'Jumlah (Rp)' },
+    { key: 'pinjaman', label: 'Pinjaman Baru (Pencairan)', table: 'pinjaman', kind: 'pinjaman', amountLabel: 'Jumlah Pinjaman (Rp)' },
+    { key: 'angsuran', label: 'Angsuran (Bendahara/Anggota)', table: 'angsuran', kind: 'angsuran', amountLabel: 'Jumlah (Rp)' },
+    { key: 'operasional', label: 'Operasional', table: 'operasional', kind: 'expense', amountLabel: 'Jumlah (Rp)' },
+    { key: 'warung_cleo', label: 'Warung + Cleo', table: 'warung_cleo', kind: 'expense', amountLabel: 'Jumlah (Rp)' },
+    { key: 'pengambilan_simpanan', label: 'Pengambilan Simpanan', table: 'pengambilan_simpanan', kind: 'pengambilan', amountLabel: 'Jumlah (Rp)' },
+];
+
+interface AnggotaOption {
+    id: number;
+    no_kku: string;
+    nama: string;
+}
+
+interface Row {
+    id: number;
+    id_anggota?: number | null;
+    nama_entitas?: string;
+    deskripsi?: string;
+    tipe?: string | null;
+    keterangan?: string | null;
+    bulan: number;
+    tahun: number;
+    jumlah: number;
+    anggota?: { nama: string; no_kku: string } | null;
+}
+
+const PAGE_SIZE = 20;
+
+export function LaporanKeuanganPage() {
+    const [categoryKey, setCategoryKey] = useState(CATEGORIES[0].key);
+    const category = useMemo(() => CATEGORIES.find((c) => c.key === categoryKey)!, [categoryKey]);
+
+    const [anggotaOptions, setAnggotaOptions] = useState<AnggotaOption[]>([]);
+    const [items, setItems] = useState<Row[]>([]);
+    const [page, setPage] = useState(1);
+    const [total, setTotal] = useState(0);
+    const [filterTahun, setFilterTahun] = useState(2025);
+    const [filterBulan, setFilterBulan] = useState<number | ''>('');
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
+    const [modalOpen, setModalOpen] = useState(false);
+    const [editing, setEditing] = useState<Row | null>(null);
+    const [saving, setSaving] = useState(false);
+
+    const [form, setForm] = useState<any>({});
+
+    const lastPage = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+    useEffect(() => {
+        supabase.from('anggota').select('id, no_kku, nama').order('nama')
+            .then(({ data }) => setAnggotaOptions(data ?? []));
+    }, []);
+
+    const load = useCallback(async () => {
+        setLoading(true);
+        setError(null);
+        try {
+            const from = (page - 1) * PAGE_SIZE;
+            const to = from + PAGE_SIZE - 1;
+
+            const selectCols = category.kind === 'expense'
+                ? 'id, deskripsi, bulan, tahun, jumlah'
+                : category.kind === 'angsuran'
+                    ? 'id, nama_entitas, id_anggota, bulan, tahun, jumlah, anggota(nama, no_kku)'
+                    : category.kind === 'pinjaman'
+                        ? 'id, id_anggota, bulan, tahun, jumlah, keterangan, anggota(nama, no_kku)'
+                        : category.kind === 'pengambilan'
+                            ? 'id, id_anggota, tipe, bulan, tahun, jumlah, anggota(nama, no_kku)'
+                            : 'id, id_anggota, bulan, tahun, jumlah, anggota(nama, no_kku)';
+
+            // Check the count first â€” requesting .range() on a table with zero
+            // matching rows causes a 416 error from PostgREST, so avoid that.
+            let countQuery = supabase.from(category.table).select('id', { count: 'exact', head: true }).eq('tahun', filterTahun);
+            if (filterBulan !== '') countQuery = countQuery.eq('bulan', filterBulan);
+            const { count: totalCount } = await countQuery;
+
+            if (!totalCount) {
+                setItems([]);
+                setTotal(0);
+                setLoading(false);
+                return;
+            }
+
+            let query = supabase
+                .from(category.table)
+                .select(selectCols, { count: 'exact' })
+                .eq('tahun', filterTahun)
+                .order('bulan')
+                .range(from, to);
+
+            if (filterBulan !== '') query = query.eq('bulan', filterBulan);
+
+            const { data, count, error: err } = await query;
+            if (err) throw err;
+
+            setItems((data as any) ?? []);
+            setTotal(count ?? 0);
+        } catch (err) {
+            console.error(err);
+            setError('Gagal memuat data');
+        } finally {
+            setLoading(false);
+        }
+    }, [category, page, filterTahun, filterBulan]);
+
+    useEffect(() => { setPage(1); }, [categoryKey]);
+    useEffect(() => { load(); }, [load]);
+
+    const emptyFormFor = () => ({
+        id_anggota: '',
+        nama_entitas: '',
+        deskripsi: '',
+        tipe: 'SW',
+        keterangan: '',
+        bulan: filterBulan || new Date().getMonth() + 1,
+        tahun: filterTahun,
+        jumlah: '',
+    });
+
+    const openCreate = () => {
+        setEditing(null);
+        setForm(emptyFormFor());
+        setModalOpen(true);
+    };
+
+    const openEdit = (item: Row) => {
+        setEditing(item);
+        setForm({
+            id_anggota: item.id_anggota != null ? String(item.id_anggota) : '',
+            nama_entitas: item.nama_entitas ?? '',
+            deskripsi: item.deskripsi ?? '',
+            tipe: item.tipe ?? 'SW',
+            keterangan: item.keterangan ?? '',
+            bulan: item.bulan,
+            tahun: item.tahun,
+            jumlah: String(item.jumlah),
+        });
+        setModalOpen(true);
+    };
+
+    const handleSubmit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setSaving(true);
+        try {
+            const jumlah = Number(form.jumlah) || 0;
+            const payload: any = { bulan: form.bulan, tahun: form.tahun, jumlah };
+
+            if (category.kind === 'expense') {
+                payload.deskripsi = form.deskripsi;
+            } else if (category.kind === 'angsuran') {
+                payload.nama_entitas = form.nama_entitas;
+                payload.id_anggota = form.id_anggota ? Number(form.id_anggota) : null;
+            } else if (category.kind === 'pinjaman') {
+                payload.id_anggota = Number(form.id_anggota);
+                payload.keterangan = form.keterangan || null;
+            } else if (category.kind === 'pengambilan') {
+                payload.id_anggota = Number(form.id_anggota);
+                payload.tipe = form.tipe;
+            } else {
+                payload.id_anggota = Number(form.id_anggota);
+            }
+
+            if (editing) {
+                const { error: err } = await supabase.from(category.table).update(payload).eq('id', editing.id);
+                if (err) throw err;
+            } else {
+                const { error: err } = await supabase.from(category.table).insert(payload);
+                if (err) throw err;
+            }
+
+            setModalOpen(false);
+            load();
+        } catch (err) {
+            console.error(err);
+            alert('Gagal menyimpan data');
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    const handleDelete = async (item: Row) => {
+        if (!confirm('Hapus data ini?')) return;
+        try {
+            const { error: err } = await supabase.from(category.table).delete().eq('id', item.id);
+            if (err) throw err;
+            load();
+        } catch (err) {
+            console.error(err);
+            alert('Gagal menghapus data');
+        }
+    };
+
+    return (
+        <div className="p-6 max-w-7xl mx-auto">
+            <PageHeader title="Laporan Keuangan" description="Simpanan pokok/khusus, provisi, asuransi, pinjaman, angsuran, operasional, warung+cleo, pengambilan simpanan" actionLabel="Tambah" onAction={openCreate}>
+                <div className="flex gap-2 items-center flex-wrap">
+                    <select className={selectClass} value={categoryKey} onChange={(e) => setCategoryKey(e.target.value)}>
+                        {CATEGORIES.map((c) => (
+                            <option key={c.key} value={c.key}>{c.label}</option>
+                        ))}
+                    </select>
+                    <select className={selectClass} value={filterTahun} onChange={(e) => { setFilterTahun(Number(e.target.value)); setPage(1); }}>
+                        <option value={2025}>2025</option>
+                        <option value={2026}>2026</option>
+                    </select>
+                    <select className={selectClass} value={filterBulan} onChange={(e) => { setFilterBulan(e.target.value ? Number(e.target.value) : ''); setPage(1); }}>
+                        <option value="">Semua Bulan</option>
+                        {MONTHS.map((m, i) => (
+                            <option key={i} value={i + 1}>{m}</option>
+                        ))}
+                    </select>
+                </div>
+            </PageHeader>
+
+            <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
+                {loading ? <LoadingState /> : error ? <ErrorState message={error} /> : items.length === 0 ? (
+                    <EmptyState message="Belum ada data untuk kategori/periode ini" />
+                ) : (
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-left">
+                            <thead>
+                                <tr className="bg-gray-50 border-b border-gray-100">
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase">Bulan</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase">
+                                        {category.kind === 'expense' ? 'Deskripsi' : category.kind === 'angsuran' ? 'Entitas' : 'Anggota'}
+                                    </th>
+                                    {category.kind === 'pengambilan' && <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase">Tipe</th>}
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase text-right">Jumlah</th>
+                                    <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase text-right">Aksi</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-100">
+                                {items.map((item) => (
+                                    <tr key={item.id} className="hover:bg-gray-50/50">
+                                        <td className="py-3 px-6 text-sm text-gray-600">{MONTHS[item.bulan - 1]} {item.tahun}</td>
+                                        <td className="py-3 px-6 text-sm text-gray-900">
+                                            {category.kind === 'expense'
+                                                ? item.deskripsi
+                                                : category.kind === 'angsuran'
+                                                    ? (item.anggota?.nama ?? item.nama_entitas)
+                                                    : (item.anggota ? `${item.anggota.nama} (${item.anggota.no_kku})` : '-')}
+                                        </td>
+                                        {category.kind === 'pengambilan' && <td className="py-3 px-6 text-sm text-gray-600">{item.tipe}</td>}
+                                        <td className="py-3 px-6 text-sm font-medium text-gray-900 text-right">{formatIDR(Number(item.jumlah))}</td>
+                                        <td className="py-3 px-6"><ActionButtons onEdit={() => openEdit(item)} onDelete={() => handleDelete(item)} /></td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                )}
+                <Pagination currentPage={page} lastPage={lastPage} total={total} onPageChange={setPage} />
+            </div>
+
+            <Modal open={modalOpen} title={editing ? `Edit ${category.label}` : `Tambah ${category.label}`} onClose={() => setModalOpen(false)}>
+                <form onSubmit={handleSubmit}>
+                    {category.kind === 'expense' && (
+                        <FormField label="Deskripsi" required>
+                            <input className={inputClass} required value={form.deskripsi} onChange={(e) => setForm({ ...form, deskripsi: e.target.value })} />
+                        </FormField>
+                    )}
+
+                    {category.kind === 'angsuran' && (
+                        <>
+                            <FormField label="Nama Entitas (mis. 'BEND REKTORAT' atau nama anggota)" required>
+                                <input className={inputClass} required value={form.nama_entitas} onChange={(e) => setForm({ ...form, nama_entitas: e.target.value })} />
+                            </FormField>
+                            <FormField label="Kaitkan ke Anggota (opsional)">
+                                <SearchableSelect
+                                    value={form.id_anggota}
+                                    onChange={(v) => setForm({ ...form, id_anggota: v })}
+                                    placeholder="Cari anggota (kosongkan jika entri bendahara)..."
+                                    options={anggotaOptions.map((a) => ({ value: String(a.id), label: `${a.no_kku} â€” ${a.nama}` }))}
+                                />
+                            </FormField>
+                        </>
+                    )}
+
+                    {(category.kind === 'anggota_simple' || category.kind === 'pinjaman' || category.kind === 'pengambilan') && (
+                        <FormField label="Anggota" required>
+                            <SearchableSelect
+                                disabled={!!editing}
+                                value={form.id_anggota}
+                                onChange={(v) => setForm({ ...form, id_anggota: v })}
+                                placeholder="Cari nama / no KKU..."
+                                options={anggotaOptions.map((a) => ({ value: String(a.id), label: `${a.no_kku} â€” ${a.nama}` }))}
+                            />
+                        </FormField>
+                    )}
+
+                    {category.kind === 'pengambilan' && (
+                        <FormField label="Tipe" required>
+                            <select className={selectClass} value={form.tipe} onChange={(e) => setForm({ ...form, tipe: e.target.value })}>
+                                <option value="SW">SW (Simpanan Wajib)</option>
+                                <option value="SS">SS (Simpanan Sukarela)</option>
+                            </select>
+                        </FormField>
+                    )}
+
+                    <FormField label="Bulan" required>
+                        <select className={selectClass} disabled={!!editing} value={form.bulan} onChange={(e) => setForm({ ...form, bulan: Number(e.target.value) })}>
+                            {MONTHS.map((m, i) => (
+                                <option key={i} value={i + 1}>{m}</option>
+                            ))}
+                        </select>
+                    </FormField>
+                    <FormField label="Tahun" required>
+                        <input type="number" className={inputClass} disabled={!!editing} required value={form.tahun} onChange={(e) => setForm({ ...form, tahun: Number(e.target.value) })} />
+                    </FormField>
+                    <FormField label={category.amountLabel} required>
+                        <input type="number" min="0" className={inputClass} required value={form.jumlah} onChange={(e) => setForm({ ...form, jumlah: e.target.value })} />
+                    </FormField>
+
+                    {category.kind === 'pinjaman' && (
+                        <FormField label="Keterangan">
+                            <textarea className={inputClass} rows={2} value={form.keterangan} onChange={(e) => setForm({ ...form, keterangan: e.target.value })} />
+                        </FormField>
+                    )}
+
+                    <FormActions onCancel={() => setModalOpen(false)} saving={saving} />
+                </form>
+            </Modal>
+        </div>
+    );
+}
+
+
+===== src\pages\LaporanRekapitulasiPage.tsx =====
+import { useEffect, useMemo, useState } from 'react';
+import { Download, Loader2 } from 'lucide-react';
+import ExcelJS from 'exceljs';
+import { supabase } from '../supabaseClient';
+import { selectClass } from '../components/ui/Modal';
+import { formatIDR } from '../utils';
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
+const MONTHS_FULL = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
+
+interface MatrixSection {
+    title: string;
+    rowLabelHeader: string;
+    rows: { label: string; monthly: number[]; total: number }[];
+    grandTotal: number;
+}
+
+function buildEmptyMonthly(): number[] {
+    return Array(12).fill(0);
+}
+
+const HEADER_FILL: ExcelJS.Fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F7A54' } };
+const SECTION_FILL: ExcelJS.Fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8F5EE' } };
+const THIN_BORDER: Partial<ExcelJS.Borders> = {
+    top: { style: 'thin', color: { argb: 'FFD1D5DB' } },
+    left: { style: 'thin', color: { argb: 'FFD1D5DB' } },
+    bottom: { style: 'thin', color: { argb: 'FFD1D5DB' } },
+    right: { style: 'thin', color: { argb: 'FFD1D5DB' } },
+};
+const NUMBER_FORMAT = '#,##0';
+
+export function LaporanRekapitulasiPage() {
+    const [tahun, setTahun] = useState(2025);
+    const [loading, setLoading] = useState(true);
+    const [exporting, setExporting] = useState(false);
+    const [sections, setSections] = useState<MatrixSection[]>([]);
+    const [unitFilter, setUnitFilter] = useState<string>('');
+    const [units, setUnits] = useState<string[]>([]);
+    const [filterBulan, setFilterBulan] = useState<number | ''>('');
+
+    useEffect(() => {
+        loadData();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [tahun, unitFilter]);
+
+    async function loadData() {
+        setLoading(true);
+        try {
+            const { data: txRows } = await supabase
+                .from('transaksi_potongan')
+                .select('bulan, simwa, sukarela, anggota!inner(id_unit, unit_kerja(nama_unit))')
+                .eq('tahun', tahun)
+                .range(0, 9999);
+
+            const unitSimwa = new Map<string, number[]>();
+            const unitSukarela = new Map<string, number[]>();
+            const unitNames = new Set<string>();
+
+            for (const row of (txRows as any) ?? []) {
+                const unitName = row.anggota?.unit_kerja?.nama_unit ?? 'Tanpa Unit';
+                unitNames.add(unitName);
+                if (!unitSimwa.has(unitName)) unitSimwa.set(unitName, buildEmptyMonthly());
+                if (!unitSukarela.has(unitName)) unitSukarela.set(unitName, buildEmptyMonthly());
+                const idx = row.bulan - 1;
+                if (idx < 0 || idx > 11) continue;
+                unitSimwa.get(unitName)![idx] += Number(row.simwa) || 0;
+                unitSukarela.get(unitName)![idx] += Number(row.sukarela) || 0;
+            }
+
+            setUnits(Array.from(unitNames).sort());
+
+            const toRows = (map: Map<string, number[]>) =>
+                Array.from(map.entries())
+                    .filter(([unitName]) => !unitFilter || unitName === unitFilter)
+                    .map(([label, monthly]) => ({ label, monthly, total: monthly.reduce((a, b) => a + b, 0) }))
+                    .sort((a, b) => a.label.localeCompare(b.label));
+
+            const simwaRows = toRows(unitSimwa);
+            const sukarelaRows = toRows(unitSukarela);
+
+            async function loadMemberCategory(table: string) {
+                const { data } = await supabase
+                    .from(table)
+                    .select('bulan, jumlah, anggota(nama, id_unit, unit_kerja(nama_unit))')
+                    .eq('tahun', tahun)
+                    .range(0, 9999);
+
+                const byMember = new Map<string, number[]>();
+                for (const row of (data as any) ?? []) {
+                    const memberUnit = row.anggota?.unit_kerja?.nama_unit ?? '';
+                    if (unitFilter && memberUnit !== unitFilter) continue;
+                    const name = row.anggota?.nama ?? 'Tidak diketahui';
+                    if (!byMember.has(name)) byMember.set(name, buildEmptyMonthly());
+                    const idx = row.bulan - 1;
+                    if (idx < 0 || idx > 11) continue;
+                    byMember.get(name)![idx] += Number(row.jumlah) || 0;
+                }
+                return Array.from(byMember.entries())
+                    .map(([label, monthly]) => ({ label, monthly, total: monthly.reduce((a, b) => a + b, 0) }))
+                    .sort((a, b) => a.label.localeCompare(b.label));
+            }
+
+            async function loadExpenseCategory(table: string) {
+                if (unitFilter) return [];
+                const { data } = await supabase
+                    .from(table)
+                    .select('deskripsi, bulan, jumlah')
+                    .eq('tahun', tahun)
+                    .range(0, 9999);
+
+                const byDesc = new Map<string, number[]>();
+                for (const row of (data as any) ?? []) {
+                    const desc = row.deskripsi ?? '-';
+                    if (!byDesc.has(desc)) byDesc.set(desc, buildEmptyMonthly());
+                    const idx = row.bulan - 1;
+                    if (idx < 0 || idx > 11) continue;
+                    byDesc.get(desc)![idx] += Number(row.jumlah) || 0;
+                }
+                return Array.from(byDesc.entries())
+                    .map(([label, monthly]) => ({ label, monthly, total: monthly.reduce((a, b) => a + b, 0) }));
+            }
+
+            async function loadAngsuran() {
+                const { data } = await supabase
+                    .from('angsuran')
+                    .select('nama_entitas, bulan, jumlah, anggota(id_unit, unit_kerja(nama_unit))')
+                    .eq('tahun', tahun)
+                    .range(0, 9999);
+
+                const byEntity = new Map<string, number[]>();
+                for (const row of (data as any) ?? []) {
+                    const memberUnit = row.anggota?.unit_kerja?.nama_unit ?? '';
+                    if (unitFilter && memberUnit !== unitFilter) continue;
+                    const name = row.nama_entitas ?? '-';
+                    if (!byEntity.has(name)) byEntity.set(name, buildEmptyMonthly());
+                    const idx = row.bulan - 1;
+                    if (idx < 0 || idx > 11) continue;
+                    byEntity.get(name)![idx] += Number(row.jumlah) || 0;
+                }
+                return Array.from(byEntity.entries())
+                    .map(([label, monthly]) => ({ label, monthly, total: monthly.reduce((a, b) => a + b, 0) }));
+            }
+
+            const [pokokRows, khususRows, provisiRows, asuransiRows, pinjamanRows, operasionalRows, warungRows, pengambilanRows, angsuranRows] =
+                await Promise.all([
+                    loadMemberCategory('simpanan_pokok'),
+                    loadMemberCategory('simpanan_khusus'),
+                    loadMemberCategory('provisi'),
+                    loadMemberCategory('asuransi'),
+                    loadMemberCategory('pinjaman'),
+                    loadExpenseCategory('operasional'),
+                    loadExpenseCategory('warung_cleo'),
+                    loadMemberCategory('pengambilan_simpanan'),
+                    loadAngsuran(),
+                ]);
+
+            const makeSection = (title: string, rowLabelHeader: string, rows: MatrixSection['rows']): MatrixSection => ({
+                title, rowLabelHeader, rows,
+                grandTotal: rows.reduce((sum, r) => sum + r.total, 0),
+            });
+
+            setSections([
+                makeSection('Rekapitulasi Simpanan Wajib', 'Unit Kerja', simwaRows),
+                makeSection('Rekapitulasi Simpanan Sukarela', 'Unit Kerja', sukarelaRows),
+                makeSection('Rekapitulasi Simpanan Pokok', 'Anggota', pokokRows),
+                makeSection('Rekapitulasi Simpanan Khusus', 'Anggota', khususRows),
+                makeSection('Rekapitulasi Provisi', 'Anggota', provisiRows),
+                makeSection('Rekapitulasi Asuransi', 'Anggota', asuransiRows),
+                makeSection('Rekapitulasi Pinjaman', 'Anggota', pinjamanRows),
+                makeSection('Rekapitulasi Angsuran Pokok dan Jasa', 'Entitas', angsuranRows),
+                makeSection('Rekapitulasi Operasional', 'Operasional', operasionalRows),
+                makeSection('Rekapitulasi Warung + Cleo', 'Modal Warung + Cleo', warungRows),
+                makeSection('Pengambilan Simpanan', 'Anggota', pengambilanRows),
+            ]);
+        } catch (err) {
+            console.error(err);
+        } finally {
+            setLoading(false);
+        }
+    }
+
+    const displayMonthIndices = filterBulan === '' ? MONTHS.map((_, i) => i) : [filterBulan - 1];
+    const displayMonths = filterBulan === '' ? MONTHS : [MONTHS[filterBulan - 1]];
+
+    const displaySections = useMemo(() => {
+        return sections.map((s) => {
+            const rows = s.rows.map((r) => {
+                const monthly = displayMonthIndices.map((i) => r.monthly[i]);
+                return { ...r, monthly, total: monthly.reduce((a, b) => a + b, 0) };
+            });
+            return { ...s, rows, grandTotal: rows.reduce((sum, r) => sum + r.total, 0) };
+        });
+    }, [sections, filterBulan]);
+
+    const totalPemasukan = useMemo(() => {
+        const names = ['Rekapitulasi Simpanan Wajib', 'Rekapitulasi Simpanan Sukarela', 'Rekapitulasi Simpanan Pokok', 'Rekapitulasi Simpanan Khusus', 'Rekapitulasi Provisi', 'Rekapitulasi Asuransi', 'Rekapitulasi Angsuran Pokok dan Jasa'];
+        return displaySections.filter((s) => names.includes(s.title)).reduce((sum, s) => sum + s.grandTotal, 0);
+    }, [displaySections]);
+
+    const totalPengeluaran = useMemo(() => {
+        const names = ['Rekapitulasi Pinjaman', 'Rekapitulasi Operasional', 'Rekapitulasi Warung + Cleo', 'Pengambilan Simpanan'];
+        return displaySections.filter((s) => names.includes(s.title)).reduce((sum, s) => sum + s.grandTotal, 0);
+    }, [displaySections]);
+
+    async function exportToExcel() {
+        setExporting(true);
+        try {
+            const wb = new ExcelJS.Workbook();
+            const sheetLabel = filterBulan === '' ? `Laporan ${tahun}` : `${MONTHS[filterBulan - 1]} ${tahun}`;
+            const ws = wb.addWorksheet(sheetLabel, {
+                views: [{ state: 'frozen', ySplit: 4 }],
+            });
+
+            const totalCols = 2 + displayMonths.length + 1;
+            ws.columns = [
+                { width: 5 },
+                { width: 32 },
+                ...displayMonths.map(() => ({ width: 13 })),
+                { width: 16 },
+            ];
+
+            ws.mergeCells(1, 1, 1, totalCols);
+            ws.getCell(1, 1).value = 'LAPORAN SIMPAN PINJAM';
+            ws.mergeCells(2, 1, 2, totalCols);
+            ws.getCell(2, 1).value = `KOPERASI KESEJAHTERAAN UNIVERSITAS${unitFilter ? ' â€” ' + unitFilter : ''}`;
+            ws.mergeCells(3, 1, 3, totalCols);
+            ws.getCell(3, 1).value = filterBulan === '' ? `TAHUN ${tahun}` : `${MONTHS_FULL[filterBulan - 1]} ${tahun}`;
+            for (let r = 1; r <= 3; r++) {
+                const cell = ws.getCell(r, 1);
+                cell.font = { bold: true, size: r === 1 ? 14 : 11 };
+                cell.alignment = { horizontal: 'left' };
+            }
+            ws.addRow([]);
+
+            for (const section of displaySections) {
+                const titleRow = ws.addRow([section.title]);
+                ws.mergeCells(titleRow.number, 1, titleRow.number, totalCols);
+                titleRow.getCell(1).font = { bold: true, size: 12 };
+                titleRow.getCell(1).fill = SECTION_FILL;
+                for (let c = 1; c <= totalCols; c++) {
+                    titleRow.getCell(c).fill = SECTION_FILL;
+                }
+
+                const headerRow = ws.addRow(['No.', section.rowLabelHeader, ...displayMonths, 'Total']);
+                headerRow.eachCell((cell) => {
+                    cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+                    cell.fill = HEADER_FILL;
+                    cell.alignment = { horizontal: 'center', vertical: 'middle' };
+                    cell.border = THIN_BORDER;
+                });
+
+                section.rows.forEach((row, i) => {
+                    const dataRow = ws.addRow([i + 1, row.label, ...row.monthly, row.total]);
+                    dataRow.eachCell((cell, colNumber) => {
+                        cell.border = THIN_BORDER;
+                        if (colNumber >= 3) {
+                            cell.numFmt = NUMBER_FORMAT;
+                            cell.alignment = { horizontal: 'right' };
+                        }
+                    });
+                    dataRow.getCell(totalCols).font = { bold: true };
+                });
+
+                const jumlahPerBulan = displayMonths.map((_, i) => section.rows.reduce((s, r) => s + r.monthly[i], 0));
+                const jumlahRow = ws.addRow(['', 'Jumlah', ...jumlahPerBulan, section.grandTotal]);
+                jumlahRow.eachCell((cell, colNumber) => {
+                    cell.font = { bold: true };
+                    cell.border = { ...THIN_BORDER, top: { style: 'double', color: { argb: 'FF9CA3AF' } } };
+                    if (colNumber >= 3) {
+                        cell.numFmt = NUMBER_FORMAT;
+                        cell.alignment = { horizontal: 'right' };
+                    }
+                });
+
+                ws.addRow([]);
+            }
+
+            const summaryTitle = ws.addRow(['RINGKASAN']);
+            summaryTitle.getCell(1).font = { bold: true, size: 12 };
+
+            const addSummaryRow = (label: string, value: number, color?: string) => {
+                const row = ws.addRow([label, value]);
+                row.getCell(1).font = { bold: true };
+                row.getCell(2).font = { bold: true, color: color ? { argb: color } : undefined };
+                row.getCell(2).numFmt = NUMBER_FORMAT;
+                row.getCell(2).alignment = { horizontal: 'right' };
+            };
+            addSummaryRow('Total Pemasukan', totalPemasukan, 'FF1F7A54');
+            addSummaryRow('Total Pengeluaran', totalPengeluaran, 'FFDC2626');
+            addSummaryRow('Saldo', totalPemasukan - totalPengeluaran);
+
+            const buffer = await wb.xlsx.writeBuffer();
+            const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `Laporan_Koperasi_${tahun}${filterBulan === '' ? '' : '_' + MONTHS_FULL[filterBulan - 1]}${unitFilter ? '_' + unitFilter.replace(/\s+/g, '_') : ''}.xlsx`;
+            a.click();
+            URL.revokeObjectURL(url);
+        } catch (err) {
+            console.error(err);
+            alert('Gagal membuat file Excel.');
+        } finally {
+            setExporting(false);
+        }
+    }
+
+    return (
+        <div className="p-6 max-w-7xl mx-auto space-y-6">
+            <div className="flex justify-between items-end flex-wrap gap-3">
+                <div>
+                    <h1 className="text-2xl font-bold text-gray-900">Laporan Rekapitulasi Lengkap</h1>
+                    <p className="text-gray-500 mt-1">Simpanan, pinjaman, operasional, dan lainnya â€” per unit kerja &amp; per anggota</p>
+                </div>
+                <div className="flex gap-2 items-center flex-wrap">
+                    <select className={selectClass} value={tahun} onChange={(e) => setTahun(Number(e.target.value))}>
+                        <option value={2025}>2025</option>
+                        <option value={2026}>2026</option>
+                        <option value={2027}>2027</option>
+                        <option value={2028}>2028</option>
+                    </select>
+                    <select className={selectClass} value={filterBulan} onChange={(e) => setFilterBulan(e.target.value ? Number(e.target.value) : '')}>
+                        <option value="">Semua Bulan</option>
+                        {MONTHS_FULL.map((m, i) => (
+                            <option key={i} value={i + 1}>{m}</option>
+                        ))}
+                    </select>
+                    <select className={selectClass} value={unitFilter} onChange={(e) => setUnitFilter(e.target.value)}>
+                        <option value="">Semua Unit Kerja</option>
+                        {units.map((u) => <option key={u} value={u}>{u}</option>)}
+                    </select>
+                    <button
+                        type="button"
+                        onClick={exportToExcel}
+                        disabled={loading || exporting}
+                        className="flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition text-sm disabled:opacity-50"
+                    >
+                        {exporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                        Export ke Excel
+                    </button>
+                </div>
+            </div>
+
+            {loading ? (
+                <div className="flex items-center gap-2 text-gray-500 py-12 justify-center">
+                    <Loader2 className="w-5 h-5 animate-spin" /> Memuat laporan...
+                </div>
+            ) : (
+                <>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        <div className="bg-white rounded-lg border border-gray-200 p-5">
+                            <p className="text-sm text-gray-500">Total Pemasukan</p>
+                            <p className="text-xl font-bold text-emerald-600 mt-1">{formatIDR(totalPemasukan)}</p>
+                        </div>
+                        <div className="bg-white rounded-lg border border-gray-200 p-5">
+                            <p className="text-sm text-gray-500">Total Pengeluaran</p>
+                            <p className="text-xl font-bold text-rose-600 mt-1">{formatIDR(totalPengeluaran)}</p>
+                        </div>
+                        <div className="bg-white rounded-lg border border-gray-200 p-5">
+                            <p className="text-sm text-gray-500">Saldo</p>
+                            <p className="text-xl font-bold text-gray-900 mt-1">{formatIDR(totalPemasukan - totalPengeluaran)}</p>
+                        </div>
+                    </div>
+
+                    {displaySections.map((section) => (
+                        <div key={section.title} className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+                            <div className="px-6 py-4 border-b border-gray-200 flex justify-between items-center">
+                                <h2 className="text-base font-bold text-gray-900">{section.title}</h2>
+                                <span className="text-sm font-medium text-gray-700">Total: {formatIDR(section.grandTotal)}</span>
+                            </div>
+                            {section.rows.length === 0 ? (
+                                <p className="px-6 py-6 text-sm text-gray-400">Tidak ada data</p>
+                            ) : (
+                                <div className="overflow-x-auto">
+                                    <table className="w-full text-left text-sm">
+                                        <thead>
+                                            <tr className="bg-gray-50 border-b border-gray-200">
+                                                <th className="px-4 py-2 font-medium text-gray-500">{section.rowLabelHeader}</th>
+                                                {displayMonths.map((m) => <th key={m} className="px-3 py-2 font-medium text-gray-500 text-right">{m}</th>)}
+                                                <th className="px-4 py-2 font-medium text-gray-500 text-right">Total</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-gray-100">
+                                            {section.rows.map((row) => (
+                                                <tr key={row.label}>
+                                                    <td className="px-4 py-2 text-gray-900">{row.label}</td>
+                                                    {row.monthly.map((v, i) => (
+                                                        <td key={i} className="px-3 py-2 text-right text-gray-600">{v ? formatIDR(v) : '-'}</td>
+                                                    ))}
+                                                    <td className="px-4 py-2 text-right font-medium text-gray-900">{formatIDR(row.total)}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            )}
+                        </div>
+                    ))}
+                </>
+            )}
+        </div>
+    );
+}
+
+
+===== src\pages\RekapitulasiPage.tsx =====
+import { useEffect, useState } from 'react';
+import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts';
+import { DollarSign, Users, TrendingUp, AlertCircle } from 'lucide-react';
+import { supabase } from '../supabaseClient';
+
+interface RekapBulan {
+  bulan: number;
+  total_simwa: number;
+  total_sukarela: number;
+  total_pokok: number;
+  total_jasa: number;
+  total_barang: number;
+  total_jumlah: number;
+}
+
+interface Summary {
+  tahun: number;
+  totalAnggota: number;
+  totalBayaran: number;
+  simpananWajib: number;
+  simpananSukarela: number;
+  simpananPokok: number;
+  totalJasa: number;
+  totalBarang: number;
+}
+
+const MONTH_NAMES = ['', 'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
+
+const COLORS = ['#10b981', '#3b82f6', '#f59e0b', '#ef4444', '#8b5cf6'];
+
+export function RekapitulasiPage() {
+  const [tahun, setTahun] = useState(2025);
+  const [rekapPerBulan, setRekapPerBulan] = useState<RekapBulan[]>([]);
+  const [summary, setSummary] = useState<Summary | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    loadData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tahun]);
+
+  const loadData = async () => {
+    try {
+      setLoading(true);
+      setError(null);
+
+      const { data: rows, error: err } = await supabase
+        .from('transaksi_potongan')
+        .select('bulan, id_anggota, simwa, sukarela, pokok, jasa, barang')
+        .eq('tahun', tahun)
+        .range(0, 9999);
+
+      if (err) throw err;
+
+      const perBulan: RekapBulan[] = Array.from({ length: 12 }, (_, i) => ({
+        bulan: i + 1,
+        total_simwa: 0,
+        total_sukarela: 0,
+        total_pokok: 0,
+        total_jasa: 0,
+        total_barang: 0,
+        total_jumlah: 0,
+      }));
+
+      const anggotaSet = new Set<number>();
+
+      for (const row of rows ?? []) {
+        const idx = row.bulan - 1;
+        if (idx < 0 || idx > 11) continue;
+        const simwa = Number(row.simwa) || 0;
+        const sukarela = Number(row.sukarela) || 0;
+        const pokok = Number(row.pokok) || 0;
+        const jasa = Number(row.jasa) || 0;
+        const barang = Number(row.barang) || 0;
+
+        perBulan[idx].total_simwa += simwa;
+        perBulan[idx].total_sukarela += sukarela;
+        perBulan[idx].total_pokok += pokok;
+        perBulan[idx].total_jasa += jasa;
+        perBulan[idx].total_barang += barang;
+        perBulan[idx].total_jumlah += simwa + sukarela + pokok + jasa + barang;
+
+        anggotaSet.add(row.id_anggota);
+      }
+
+      const totals = perBulan.reduce(
+        (acc, m) => ({
+          simpananWajib: acc.simpananWajib + m.total_simwa,
+          simpananSukarela: acc.simpananSukarela + m.total_sukarela,
+          simpananPokok: acc.simpananPokok + m.total_pokok,
+          totalJasa: acc.totalJasa + m.total_jasa,
+          totalBarang: acc.totalBarang + m.total_barang,
+          totalBayaran: acc.totalBayaran + m.total_jumlah,
+        }),
+        { simpananWajib: 0, simpananSukarela: 0, simpananPokok: 0, totalJasa: 0, totalBarang: 0, totalBayaran: 0 }
+      );
+
+      setRekapPerBulan(perBulan.filter((m) => rows?.some((r) => r.bulan === m.bulan)));
+      setSummary({ tahun, totalAnggota: anggotaSet.size, ...totals });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Gagal memuat data');
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const chartData = rekapPerBulan.map((item) => ({
+    bulan: MONTH_NAMES[item.bulan],
+    'Simpanan Wajib': Number(item.total_simwa),
+    'Simpanan Sukarela': Number(item.total_sukarela),
+    'Simpanan Pokok': Number(item.total_pokok),
+  }));
+
+  const summaryData = summary ? [
+    { name: 'Simpanan Wajib', value: Number(summary.simpananWajib) },
+    { name: 'Simpanan Sukarela', value: Number(summary.simpananSukarela) },
+    { name: 'Simpanan Pokok', value: Number(summary.simpananPokok) },
+    { name: 'Jasa', value: Number(summary.totalJasa) },
+    { name: 'Barang', value: Number(summary.totalBarang) },
+  ].filter((d) => d.value > 0) : [];
+
+  const formatCurrency = (value: number) => {
+    return new Intl.NumberFormat('id-ID', {
+      style: 'currency',
+      currency: 'IDR',
+      maximumFractionDigits: 0,
+    }).format(value);
+  };
+
+  return (
+    <div className="p-8 space-y-8">
+      <div>
+        <h1 className="text-3xl font-bold text-gray-900 mb-2">Rekapitulasi Koperasi</h1>
+        <p className="text-gray-600">Ringkasan data simpanan dan transaksi</p>
+      </div>
+
+      <div className="flex gap-4">
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Tahun</label>
+          <input
+            type="number"
+            value={tahun}
+            onChange={(e) => setTahun(Number(e.target.value))}
+            className="w-32 border border-gray-300 rounded-lg px-3 py-2 text-sm"
+          />
+        </div>
+        <button
+          onClick={loadData}
+          className="self-end px-4 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition"
+        >
+          Refresh
+        </button>
+      </div>
+
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-4 flex items-start gap-3">
+          <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
+          <p className="text-red-700">{error}</p>
+        </div>
+      )}
+
+      {loading ? (
+        <div className="text-center py-12">
+          <p className="text-gray-500">Memuat data...</p>
+        </div>
+      ) : summary && rekapPerBulan.length > 0 ? (
+        <>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="bg-white rounded-lg border border-gray-200 p-6">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-gray-500 text-sm">Anggota Aktif (Transaksi)</p>
+                  <p className="text-2xl font-bold text-gray-900 mt-2">{summary.totalAnggota}</p>
+                </div>
+                <Users className="w-10 h-10 text-emerald-600 opacity-20" />
+              </div>
+            </div>
+
+            <div className="bg-white rounded-lg border border-gray-200 p-6">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-gray-500 text-sm">Simpanan Wajib</p>
+                  <p className="text-2xl font-bold text-gray-900 mt-2">
+                    {formatCurrency(summary.simpananWajib).split(',')[0]}
+                  </p>
+                </div>
+                <DollarSign className="w-10 h-10 text-blue-600 opacity-20" />
+              </div>
+            </div>
+
+            <div className="bg-white rounded-lg border border-gray-200 p-6">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-gray-500 text-sm">Simpanan Sukarela</p>
+                  <p className="text-2xl font-bold text-gray-900 mt-2">
+                    {formatCurrency(summary.simpananSukarela).split(',')[0]}
+                  </p>
+                </div>
+                <TrendingUp className="w-10 h-10 text-amber-600 opacity-20" />
+              </div>
+            </div>
+
+            <div className="bg-white rounded-lg border border-gray-200 p-6">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-gray-500 text-sm">Total Seluruh Potongan</p>
+                  <p className="text-2xl font-bold text-gray-900 mt-2">
+                    {formatCurrency(summary.totalBayaran).split(',')[0]}
+                  </p>
+                </div>
+                <DollarSign className="w-10 h-10 text-emerald-600 opacity-20" />
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div className="bg-white rounded-lg border border-gray-200 p-6">
+              <h2 className="text-lg font-semibold text-gray-900 mb-4">Simpanan per Bulan</h2>
+              <ResponsiveContainer width="100%" height={300}>
+                <BarChart data={chartData}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="bulan" />
+                  <YAxis />
+                  <Tooltip formatter={(value) => formatCurrency(Number(value))} />
+                  <Legend />
+                  <Bar dataKey="Simpanan Wajib" fill="#10b981" />
+                  <Bar dataKey="Simpanan Sukarela" fill="#3b82f6" />
+                  <Bar dataKey="Simpanan Pokok" fill="#f59e0b" />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+
+            <div className="bg-white rounded-lg border border-gray-200 p-6">
+              <h2 className="text-lg font-semibold text-gray-900 mb-4">Komposisi Total</h2>
+              <ResponsiveContainer width="100%" height={300}>
+                <PieChart>
+                  <Pie
+                    data={summaryData}
+                    cx="50%"
+                    cy="50%"
+                    labelLine={false}
+                    label={({ name, value }) => `${name}: ${formatCurrency(value)}`}
+                    outerRadius={80}
+                    fill="#8884d8"
+                    dataKey="value"
+                  >
+                    {summaryData.map((entry, index) => (
+                      <Cell key={`${entry.name}-${index}`} fill={COLORS[index % COLORS.length]} />
+                    ))}
+                  </Pie>
+                  <Tooltip formatter={(value) => formatCurrency(Number(value))} />
+                </PieChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-lg border border-gray-200 p-6">
+            <h2 className="text-lg font-semibold text-gray-900 mb-4">Trend Penerimaan Kumulatif</h2>
+            <ResponsiveContainer width="100%" height={300}>
+              <LineChart data={chartData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="bulan" />
+                <YAxis />
+                <Tooltip formatter={(value) => formatCurrency(Number(value))} />
+                <Legend />
+                <Line type="monotone" dataKey="Simpanan Wajib" stroke="#10b981" dot={{ r: 4 }} />
+                <Line type="monotone" dataKey="Simpanan Sukarela" stroke="#3b82f6" dot={{ r: 4 }} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-200">
+              <h2 className="text-lg font-semibold text-gray-900">Rincian per Bulan</h2>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead>
+                  <tr className="bg-gray-50 border-b border-gray-200">
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Bulan</th>
+                    <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Simpanan Wajib</th>
+                    <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Simpanan Sukarela</th>
+                    <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Pokok Pinjaman</th>
+                    <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Total</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rekapPerBulan.map((item) => (
+                    <tr key={item.bulan} className="border-b border-gray-200 hover:bg-gray-50">
+                      <td className="px-6 py-4 text-sm font-medium text-gray-900">{MONTH_NAMES[item.bulan]}</td>
+                      <td className="px-6 py-4 text-sm text-right text-gray-900">{formatCurrency(Number(item.total_simwa))}</td>
+                      <td className="px-6 py-4 text-sm text-right text-gray-900">{formatCurrency(Number(item.total_sukarela))}</td>
+                      <td className="px-6 py-4 text-sm text-right text-gray-900">{formatCurrency(Number(item.total_pokok))}</td>
+                      <td className="px-6 py-4 text-sm font-semibold text-right text-emerald-600">{formatCurrency(Number(item.total_jumlah))}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      ) : (
+        <div className="text-center py-12 text-gray-400">Belum ada data untuk tahun ini</div>
+      )}
+    </div>
+  );
+}
+
+
+===== src\pages\AnggotaByFakultasPage.tsx =====
+import { useEffect, useState } from 'react';
+import { ChevronDown, ChevronUp, Search, Download } from 'lucide-react';
+import axios from 'axios';
+
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000';
+
+interface Transaksi {
+  bulan: number;
+  simwa: number;
+  sukarela: number;
+  pokok: number;
+  jasa: number;
+  barang: number;
+  total_jumlah: number;
+}
+
+interface Anggota {
+  id: number;
+  no_kku: string;
+  nama: string;
+  no_registrasi?: string;
+  transaksi_potongan: Transaksi[];
+}
+
+interface Unit {
+  id: number;
+  nama_unit: string;
+  anggota: Anggota[];
+}
+
+export function AnggotaByFakultasPage() {
+  const [tahun, setTahun] = useState(new Date().getFullYear());
+  const [units, setUnits] = useState<Unit[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [expandedUnits, setExpandedUnits] = useState<Set<number>>(new Set());
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    loadData();
+  }, [tahun]);
+
+  const loadData = async () => {
+    try {
+      setLoading(true);
+      const res = await axios.get(`${API_URL}/api/laporan/anggota-by-unit/${tahun}`);
+      setUnits(res.data.units);
+    } catch (err) {
+      console.error('Gagal memuat data:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const toggleUnit = (unitId: number) => {
+    const newExpanded = new Set(expandedUnits);
+    if (newExpanded.has(unitId)) {
+      newExpanded.delete(unitId);
+    } else {
+      newExpanded.add(unitId);
+    }
+    setExpandedUnits(newExpanded);
+  };
+
+  const filteredUnits = units.map((unit) => ({
+    ...unit,
+    anggota: unit.anggota.filter(
+      (a) =>
+        a.nama.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        a.no_kku.toLowerCase().includes(searchQuery.toLowerCase())
+    ),
+  }));
+
+  const calculateTotal = (transaksi: Transaksi[]) => {
+    return transaksi.reduce((sum, t) => sum + Number(t.total_jumlah), 0);
+  };
+
+  const formatCurrency = (value: number) => {
+    return new Intl.NumberFormat('id-ID', {
+      style: 'currency',
+      currency: 'IDR',
+      maximumFractionDigits: 0,
+    }).format(value);
+  };
+
+  const downloadCSV = () => {
+    let csv = 'Fakultas,No KKU,Nama,Total Bayaran,Simpanan Wajib,Simpanan Sukarela,Simpanan Pokok\n';
+    
+    filteredUnits.forEach((unit) => {
+      unit.anggota.forEach((anggota) => {
+        const total = calculateTotal(anggota.transaksi_potongan);
+        const simwa = anggota.transaksi_potongan.reduce((sum, t) => sum + Number(t.simwa), 0);
+        const sukarela = anggota.transaksi_potongan.reduce((sum, t) => sum + Number(t.sukarela), 0);
+        const pokok = anggota.transaksi_potongan.reduce((sum, t) => sum + Number(t.pokok), 0);
+        
+        csv += `"${unit.nama_unit}","${anggota.no_kku}","${anggota.nama}",${total},${simwa},${sukarela},${pokok}\n`;
+      });
+    });
+
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `anggota-by-fakultas-${tahun}.csv`;
+    a.click();
+  };
+
+  return (
+    <div className="p-8 space-y-6">
+      <div>
+        <h1 className="text-3xl font-bold text-gray-900 mb-2">Data Anggota per Fakultas</h1>
+        <p className="text-gray-600">Daftar anggota koperasi dikelompokkan per unit kerja</p>
+      </div>
+
+      {/* Controls */}
+      <div className="flex flex-col md:flex-row gap-4 items-start md:items-end">
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Tahun</label>
+          <input
+            type="number"
+            value={tahun}
+            onChange={(e) => setTahun(Number(e.target.value))}
+            className="w-32 border border-gray-300 rounded-lg px-3 py-2 text-sm"
+          />
+        </div>
+
+        <div className="flex-1">
+          <label className="block text-sm font-medium text-gray-700 mb-1">Cari Anggota</label>
+          <div className="relative">
+            <Search className="w-5 h-5 absolute left-3 top-2.5 text-gray-400" />
+            <input
+              type="text"
+              placeholder="Nama atau No KKU..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg text-sm"
+            />
+          </div>
+        </div>
+
+        <button
+          onClick={downloadCSV}
+          className="flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition"
+        >
+          <Download className="w-4 h-4" />
+          Export CSV
+        </button>
+      </div>
+
+      {loading ? (
+        <div className="text-center py-12">
+          <p className="text-gray-500">Memuat data...</p>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {filteredUnits.map((unit) => (
+            <div key={unit.id} className="border border-gray-200 rounded-lg overflow-hidden">
+              {/* Unit Header */}
+              <button
+                onClick={() => toggleUnit(unit.id)}
+                className="w-full px-6 py-4 bg-emerald-50 hover:bg-emerald-100 transition flex items-center justify-between"
+              >
+                <div className="flex items-center gap-3">
+                  {expandedUnits.has(unit.id) ? (
+                    <ChevronUp className="w-5 h-5 text-emerald-600" />
+                  ) : (
+                    <ChevronDown className="w-5 h-5 text-emerald-600" />
+                  )}
+                  <h3 className="font-semibold text-gray-900">{unit.nama_unit}</h3>
+                  <span className="text-sm text-gray-500">({unit.anggota.length} anggota)</span>
+                </div>
+              </button>
+
+              {/* Unit Content */}
+              {expandedUnits.has(unit.id) && (
+                <div className="border-t border-gray-200">
+                  {unit.anggota.length > 0 ? (
+                    <div className="overflow-x-auto">
+                      <table className="w-full">
+                        <thead>
+                          <tr className="bg-gray-50 border-b border-gray-200">
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">No KKU</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Nama</th>
+                            <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Simpanan Wajib</th>
+                            <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Simpanan Sukarela</th>
+                            <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase">Total</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {unit.anggota.map((anggota) => {
+                            const simwa = anggota.transaksi_potongan.reduce((sum, t) => sum + Number(t.simwa), 0);
+                            const sukarela = anggota.transaksi_potongan.reduce((sum, t) => sum + Number(t.sukarela), 0);
+                            const total = calculateTotal(anggota.transaksi_potongan);
+
+                            return (
+                              <tr key={anggota.id} className="border-b border-gray-200 hover:bg-gray-50">
+                                <td className="px-6 py-4 text-sm font-mono text-gray-900">{anggota.no_kku}</td>
+                                <td className="px-6 py-4 text-sm text-gray-900">{anggota.nama}</td>
+                                <td className="px-6 py-4 text-sm text-right text-gray-900">{formatCurrency(simwa)}</td>
+                                <td className="px-6 py-4 text-sm text-right text-gray-900">{formatCurrency(sukarela)}</td>
+                                <td className="px-6 py-4 text-sm font-semibold text-right text-emerald-600">{formatCurrency(total)}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="px-6 py-8 text-center text-gray-500">
+                      <p>Tidak ada anggota yang sesuai dengan pencarian</p>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+
+          {filteredUnits.every((u) => u.anggota.length === 0) && (
+            <div className="text-center py-12">
+              <p className="text-gray-500">Tidak ada data untuk ditampilkan</p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+
+===== src\components\Dashboard.tsx =====
+import { useEffect, useState, type ComponentType } from 'react';
+import {
+    BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
+    AreaChart, Area,
+} from 'recharts';
+import { Wallet, CreditCard, Receipt, TrendingUp, TrendingDown, Minus } from 'lucide-react';
+import { formatIDR } from '../utils';
+import { supabase } from '../supabaseClient';
+
+const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
+
+interface MonthlyRow {
+    name: string;
+    simpanan: number;
+    pinjaman: number;
+    pengeluaran: number;
+}
+
+interface Summary {
+    totalSimpanan: number;
+    totalPinjaman: number;
+    totalPengeluaran: number;
+}
+
+interface StatCardProps {
+    title: string;
+    amount: number;
+    icon: ComponentType<{ className?: string }>;
+    colorClass: string;
+    trend: 'up' | 'down' | 'neutral';
+    trendValue: string;
+}
+
+function StatCard({ title, amount, icon: Icon, colorClass, trend, trendValue }: StatCardProps) {
+    return (
+        <div className="bg-white rounded-xl border border-gray-100 p-6 shadow-sm flex flex-col">
+            <div className="flex justify-between items-start">
+                <div>
+                    <p className="text-sm font-medium text-gray-500 mb-1">{title}</p>
+                    <h3 className="text-2xl font-bold text-gray-900">{formatIDR(amount)}</h3>
+                </div>
+                <div className={`p-3 rounded-lg ${colorClass} bg-opacity-10`}>
+                    <Icon className={`w-6 h-6 ${colorClass.replace('bg-', 'text-')}`} />
+                </div>
+            </div>
+            <div className="mt-4 flex items-center text-sm">
+                {trend === 'up' ? (
+                    <TrendingUp className="w-4 h-4 text-emerald-500 mr-1" />
+                ) : trend === 'down' ? (
+                    <TrendingDown className="w-4 h-4 text-red-500 mr-1" />
+                ) : (
+                    <Minus className="w-4 h-4 text-gray-500 mr-1" />
+                )}
+                <span className={trend === 'up' ? 'text-emerald-600 font-medium' : trend === 'down' ? 'text-red-600 font-medium' : 'text-gray-600 font-medium'}>
+                    {trendValue}
+                </span>
+                <span className="text-gray-500 ml-1">dari tahun lalu</span>
+            </div>
+        </div>
+    );
+}
+
+export function Dashboard() {
+    const [year, setYear] = useState(2025);
+    const [monthlyData, setMonthlyData] = useState<MonthlyRow[] | null>(null);
+    const [summary, setSummary] = useState<Summary | null>(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
+
+    useEffect(() => {
+        async function fetchData() {
+            setLoading(true);
+            setError(null);
+            try {
+                const { data: rows, error: err } = await supabase
+                    .from('transaksi_potongan')
+                    .select('bulan, simwa, sukarela, pokok, jasa, barang')
+                    .eq('tahun', year)
+                    .range(0, 9999);
+
+                if (err) throw err;
+
+                const monthly: MonthlyRow[] = MONTH_NAMES.map((name) => ({
+                    name, simpanan: 0, pinjaman: 0, pengeluaran: 0,
+                }));
+
+                for (const row of rows ?? []) {
+                    const idx = row.bulan - 1;
+                    if (idx < 0 || idx > 11) continue;
+                    monthly[idx].simpanan += (Number(row.simwa) || 0) + (Number(row.sukarela) || 0);
+                    monthly[idx].pinjaman += (Number(row.pokok) || 0) + (Number(row.jasa) || 0);
+                    monthly[idx].pengeluaran += Number(row.barang) || 0;
+                }
+
+                const totals = monthly.reduce(
+                    (acc, m) => ({
+                        totalSimpanan: acc.totalSimpanan + m.simpanan,
+                        totalPinjaman: acc.totalPinjaman + m.pinjaman,
+                        totalPengeluaran: acc.totalPengeluaran + m.pengeluaran,
+                    }),
+                    { totalSimpanan: 0, totalPinjaman: 0, totalPengeluaran: 0 }
+                );
+
+                setMonthlyData(monthly);
+                setSummary(totals);
+            } catch (err) {
+                console.error(err);
+                setError(err instanceof Error ? err.message : 'Gagal memuat data dashboard');
+            } finally {
+                setLoading(false);
+            }
+        }
+
+        fetchData();
+    }, [year]);
+
+    if (loading) {
+        return (
+            <div className="p-6 max-w-7xl mx-auto">
+                <p className="text-gray-500">Memuat data dari Supabase...</p>
+            </div>
+        );
+    }
+
+    if (error) {
+        return (
+            <div className="p-6 max-w-7xl mx-auto">
+                <p className="text-red-600">{error}</p>
+            </div>
+        );
+    }
+
+    return (
+        <div className="p-6 max-w-7xl mx-auto space-y-6">
+            <div className="flex justify-between items-end mb-6">
+                <div>
+                    <h1 className="text-2xl font-bold text-gray-900">Dashboard Akumulasi {year}</h1>
+                    <p className="text-gray-500 mt-1">Ringkasan transaksi Koperasi Kesejahteraan Universitas tahun {year}</p>
+                    <p className="text-xs text-emerald-600 mt-2">
+                        Data live dari Supabase
+                    </p>
+                </div>
+                <select
+                    value={year}
+                    onChange={(e) => setYear(Number(e.target.value))}
+                    className="bg-white px-4 py-2 border border-gray-200 rounded-lg shadow-sm text-sm font-medium text-gray-700 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                >
+                    <option value={2025}>Tahun 2025</option>
+                    <option value={2026}>Tahun 2026</option>
+                    <option value={2027}>Tahun 2027</option>
+                    <option value={2028}>Tahun 2028</option>
+                </select>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <StatCard
+                    title={`Total Simpanan (${year})`}
+                    amount={summary.totalSimpanan}
+                    icon={Wallet}
+                    colorClass="bg-blue-500 text-blue-600"
+                    trend="up"
+                    trendValue="+12.5%"
+                />
+                <StatCard
+                    title={`Total Pinjaman (${year})`}
+                    amount={summary.totalPinjaman}
+                    icon={CreditCard}
+                    colorClass="bg-amber-500 text-amber-600"
+                    trend="up"
+                    trendValue="+5.2%"
+                />
+                <StatCard
+                    title={`Total Pengeluaran (${year})`}
+                    amount={summary.totalPengeluaran}
+                    icon={Receipt}
+                    colorClass="bg-rose-500 text-rose-600"
+                    trend="down"
+                    trendValue="-2.1%"
+                />
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-6">
+                    <h2 className="text-lg font-bold text-gray-900 mb-4">Perbandingan Simpanan & Pinjaman</h2>
+                    <div className="h-80 w-full">
+                        <ResponsiveContainer width="100%" height="100%">
+                            <BarChart data={monthlyData} margin={{ top: 10, right: 10, left: 20, bottom: 0 }}>
+                                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e5e7eb" />
+                                <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{ fill: '#6b7280' }} />
+                                <YAxis
+                                    axisLine={false}
+                                    tickLine={false}
+                                    tick={{ fill: '#6b7280' }}
+                                    tickFormatter={(value) => `${(value / 1000000)}M`}
+                                />
+                                <Tooltip
+                                    formatter={(value) => formatIDR(Number(value))}
+                                    cursor={{ fill: '#f3f4f6' }}
+                                    contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
+                                />
+                                <Legend iconType="circle" wrapperStyle={{ paddingTop: '20px' }} />
+                                <Bar dataKey="simpanan" name="Simpanan" fill="#3b82f6" radius={[4, 4, 0, 0]} barSize={20} />
+                                <Bar dataKey="pinjaman" name="Pinjaman" fill="#f59e0b" radius={[4, 4, 0, 0]} barSize={20} />
+                            </BarChart>
+                        </ResponsiveContainer>
+                    </div>
+                </div>
+
+                <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-6">
+                    <h2 className="text-lg font-bold text-gray-900 mb-4">Tren Pengeluaran Koperasi</h2>
+                    <div className="h-80 w-full">
+                        <ResponsiveContainer width="100%" height="100%">
+                            <AreaChart data={monthlyData} margin={{ top: 10, right: 10, left: 20, bottom: 0 }}>
+                                <defs>
+                                    <linearGradient id="colorPengeluaran" x1="0" y1="0" x2="0" y2="1">
+                                        <stop offset="5%" stopColor="#f43f5e" stopOpacity={0.3} />
+                                        <stop offset="95%" stopColor="#f43f5e" stopOpacity={0} />
+                                    </linearGradient>
+                                </defs>
+                                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e5e7eb" />
+                                <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{ fill: '#6b7280' }} />
+                                <YAxis
+                                    axisLine={false}
+                                    tickLine={false}
+                                    tick={{ fill: '#6b7280' }}
+                                    tickFormatter={(value) => `${(value / 1000000)}M`}
+                                />
+                                <Tooltip
+                                    formatter={(value) => formatIDR(Number(value))}
+                                    contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
+                                />
+                                <Legend iconType="circle" wrapperStyle={{ paddingTop: '20px' }} />
+                                <Area
+                                    type="monotone"
+                                    dataKey="pengeluaran"
+                                    name="Pengeluaran"
+                                    stroke="#f43f5e"
+                                    strokeWidth={3}
+                                    fillOpacity={1}
+                                    fill="url(#colorPengeluaran)"
+                                />
+                            </AreaChart>
+                        </ResponsiveContainer>
+                    </div>
+                </div>
+            </div>
+
+            <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden mt-6">
+                <div className="px-6 py-5 border-b border-gray-100 flex justify-between items-center bg-gray-50/50">
+                    <h2 className="text-lg font-bold text-gray-900">Rincian Akumulasi Bulanan {year}</h2>
+                </div>
+                <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse">
+                        <thead>
+                            <tr className="bg-gray-50 border-b border-gray-100">
+                                <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase tracking-wider">Bulan</th>
+                                <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase tracking-wider text-right">Simpanan</th>
+                                <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase tracking-wider text-right">Pinjaman</th>
+                                <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase tracking-wider text-right">Pengeluaran</th>
+                                <th className="py-3 px-6 text-xs font-semibold text-gray-500 uppercase tracking-wider text-right">Saldo Bersih</th>
+                            </tr>
+                        </thead>
+                        <tbody className="divide-y divide-gray-100">
+                            {monthlyData.map((row, idx) => {
+                                const netBalance = row.simpanan - row.pinjaman - row.pengeluaran;
+                                return (
+                                    <tr key={idx} className="hover:bg-gray-50/50 transition-colors">
+                                        <td className="py-3 px-6 whitespace-nowrap text-sm font-medium text-gray-900">{row.name} {year}</td>
+                                        <td className="py-3 px-6 whitespace-nowrap text-sm text-gray-600 text-right">{formatIDR(row.simpanan)}</td>
+                                        <td className="py-3 px-6 whitespace-nowrap text-sm text-gray-600 text-right">{formatIDR(row.pinjaman)}</td>
+                                        <td className="py-3 px-6 whitespace-nowrap text-sm text-gray-600 text-right">{formatIDR(row.pengeluaran)}</td>
+                                        <td className={`py-3 px-6 whitespace-nowrap text-sm font-medium text-right ${netBalance >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+                                            {netBalance >= 0 ? '+' : ''}{formatIDR(netBalance)}
+                                        </td>
+                                    </tr>
+                                );
+                            })}
+                        </tbody>
+                        <tfoot className="bg-gray-50 font-bold border-t-2 border-gray-200">
+                            <tr>
+                                <td className="py-4 px-6 text-sm text-gray-900">Total {year}</td>
+                                <td className="py-4 px-6 text-sm text-blue-600 text-right">{formatIDR(summary.totalSimpanan)}</td>
+                                <td className="py-4 px-6 text-sm text-amber-600 text-right">{formatIDR(summary.totalPinjaman)}</td>
+                                <td className="py-4 px-6 text-sm text-rose-600 text-right">{formatIDR(summary.totalPengeluaran)}</td>
+                                <td className="py-4 px-6 text-sm text-emerald-600 text-right">
+                                    {formatIDR(summary.totalSimpanan - summary.totalPinjaman - summary.totalPengeluaran)}
+                                </td>
+                            </tr>
+                        </tfoot>
+                    </table>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+
+===== src\components\UploadLaporan.tsx =====
+import { useState } from 'react';
+import { Upload, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
+import * as XLSX from 'xlsx';
+import { supabase } from '../supabaseClient';
+
+const MONTHS = [
+    'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
+    'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember',
+];
+
+const MONTH_ABBR_MAP: Record<string, number> = {
+    JAN: 1, JANUARI: 1,
+    FEB: 2, FEBRUARI: 2,
+    MAR: 3, MARET: 3,
+    APR: 4, APRIL: 4,
+    MEI: 5,
+    JUN: 6, JUNI: 6,
+    JUL: 7, JULI: 7,
+    AGU: 8, AGUS: 8, AGUSTUS: 8,
+    SEP: 9, SEPTEMBER: 9,
+    OKT: 10, OKTOBER: 10,
+    NOV: 11, NOVEMBER: 11,
+    DES: 12, DESEMBER: 12,
+};
+
+interface ParsedRow {
+    unit: string;
+    no_kku: string;
+    nama: string;
+    cicilan_ke: string | null;
+    simwa: number;
+    sukarela: number;
+    pokok: number;
+    jasa: number;
+    barang: number;
+}
+
+interface ImportResults {
+    unitsFound: string[];
+    unitsCreated: number;
+    anggotaCreated: number;
+    anggotaMatched: number;
+    transaksiCreated: number;
+    transaksiUpdated: number;
+    rowErrors: { no_kku: string; error: string }[];
+}
+
+// Walks the sheet row-by-row. Detects "DAFTAR POTONGAN...(UNIT)" lines to know
+// which unit_kerja a block of members belongs to, and treats any row whose
+// first column is a positive number as a real data row (this naturally skips
+// the header rows and the "Bendahara / Ketua Koperasi" signature footer that
+// appears between each unit section).
+function parseWorkbookSheet(sheet: XLSX.WorkSheet): ParsedRow[] {
+    const rows: any[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: null });
+    const parsed: ParsedRow[] = [];
+    let currentUnit: string | null = null;
+
+    for (const row of rows) {
+        const firstCell = row[0] != null ? String(row[0]).trim() : '';
+
+        if (firstCell.toUpperCase().includes('DAFTAR POTONGAN')) {
+            const prefix = 'DAFTAR POTONGAN KOPERASI KESEJAHTREAAN UNSUR';
+            let rest = firstCell.toUpperCase().startsWith(prefix)
+                ? firstCell.slice(prefix.length).trim()
+                : firstCell.trim();
+            if (rest.startsWith('-')) rest = rest.slice(1).trim();
+            const parenMatch = rest.match(/^\(([^)]+)\)$/);
+            currentUnit = parenMatch ? parenMatch[1].trim() : rest;
+            continue;
+        }
+
+        const rowNum = Number(firstCell);
+        const noKku = row[1] != null ? String(row[1]).trim() : '';
+        const nama = row[2] != null ? String(row[2]).trim() : '';
+
+        const looksLikeDataRow = Number.isInteger(rowNum) && rowNum > 0 && noKku !== '' && nama !== '';
+        if (!looksLikeDataRow || !currentUnit) continue;
+
+        parsed.push({
+            unit: currentUnit,
+            no_kku: noKku,
+            nama,
+            cicilan_ke: row[4] != null ? String(row[4]).trim() : null,
+            simwa: Number(row[5]) || 0,
+            sukarela: Number(row[6]) || 0,
+            pokok: Number(row[7]) || 0,
+            jasa: Number(row[8]) || 0,
+            barang: Number(row[9]) || 0,
+        });
+    }
+
+    return parsed;
+}
+
+type UploadStatus =
+    | { type: 'idle' }
+    | { type: 'loading'; message: string }
+    | { type: 'success'; results: ImportResults }
+    | { type: 'error'; message: string };
+
+export default function UploadLaporan() {
+    const [status, setStatus] = useState<UploadStatus>({ type: 'idle' });
+    const [tahun, setTahun] = useState(2025);
+    const [bulan, setBulan] = useState(1);
+
+    const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+
+        setStatus({ type: 'loading', message: 'Membaca file...' });
+
+        try {
+            const buffer = await file.arrayBuffer();
+            const workbook = XLSX.read(buffer, { type: 'array' });
+
+            const sheetMonthPairs: { sheetName: string; bulan: number }[] = [];
+            if (workbook.SheetNames.length > 1) {
+                for (const name of workbook.SheetNames) {
+                    const m = MONTH_ABBR_MAP[name.trim().toUpperCase()];
+                    if (m) sheetMonthPairs.push({ sheetName: name, bulan: m });
+                }
+            }
+            if (sheetMonthPairs.length === 0) {
+                sheetMonthPairs.push({ sheetName: workbook.SheetNames[0], bulan });
+            }
+
+            setStatus({ type: 'loading', message: 'Memproses data anggota & transaksi...' });
+
+            const results: ImportResults = {
+                unitsFound: [],
+                unitsCreated: 0,
+                anggotaCreated: 0,
+                anggotaMatched: 0,
+                transaksiCreated: 0,
+                transaksiUpdated: 0,
+                rowErrors: [],
+            };
+
+            const { data: existingUnits } = await supabase.from('unit_kerja').select('id, nama_unit');
+            const unitMap = new Map<string, number>((existingUnits ?? []).map((u) => [u.nama_unit, u.id]));
+
+            const { data: existingAnggota } = await supabase.from('anggota').select('id, no_kku');
+            const anggotaMap = new Map<string, number>((existingAnggota ?? []).map((a) => [a.no_kku, a.id]));
+
+            for (const { sheetName, bulan: bulanForSheet } of sheetMonthPairs) {
+                const rows = parseWorkbookSheet(workbook.Sheets[sheetName]);
+
+                for (const row of rows) {
+                    try {
+                        if (!results.unitsFound.includes(row.unit)) results.unitsFound.push(row.unit);
+
+                        let unitId = unitMap.get(row.unit);
+                        if (!unitId) {
+                            const { data: newUnit, error: unitErr } = await supabase
+                                .from('unit_kerja')
+                                .insert({ nama_unit: row.unit })
+                                .select('id')
+                                .single();
+                            if (unitErr) throw unitErr;
+                            unitId = newUnit.id;
+                            unitMap.set(row.unit, unitId);
+                            results.unitsCreated++;
+                        }
+
+                        let anggotaId = anggotaMap.get(row.no_kku);
+                        if (!anggotaId) {
+                            const { data: newAnggota, error: anggotaErr } = await supabase
+                                .from('anggota')
+                                .insert({ no_kku: row.no_kku, nama: row.nama, id_unit: unitId })
+                                .select('id')
+                                .single();
+                            if (anggotaErr) throw anggotaErr;
+                            anggotaId = newAnggota.id;
+                            anggotaMap.set(row.no_kku, anggotaId);
+                            results.anggotaCreated++;
+                        } else {
+                            results.anggotaMatched++;
+                        }
+
+                        const { data: existingTx } = await supabase
+                            .from('transaksi_potongan')
+                            .select('id')
+                            .eq('id_anggota', anggotaId)
+                            .eq('bulan', bulanForSheet)
+                            .eq('tahun', tahun)
+                            .maybeSingle();
+
+                        const txData = {
+                            simwa: row.simwa,
+                            sukarela: row.sukarela,
+                            pokok: row.pokok,
+                            jasa: row.jasa,
+                            barang: row.barang,
+                            cicilan_ke: row.cicilan_ke,
+                        };
+
+                        if (existingTx) {
+                            const { error: updErr } = await supabase
+                                .from('transaksi_potongan')
+                                .update(txData)
+                                .eq('id', existingTx.id);
+                            if (updErr) throw updErr;
+                            results.transaksiUpdated++;
+                        } else {
+                            const { error: insErr } = await supabase
+                                .from('transaksi_potongan')
+                                .insert({ id_anggota: anggotaId, bulan: bulanForSheet, tahun, ...txData });
+                            if (insErr) throw insErr;
+                            results.transaksiCreated++;
+                        }
+                    } catch (rowErr) {
+                        results.rowErrors.push({
+                            no_kku: row.no_kku,
+                            error: rowErr instanceof Error ? rowErr.message : String(rowErr),
+                        });
+                    }
+                }
+            }
+
+            setStatus({ type: 'success', results });
+        } catch (err) {
+            setStatus({
+                type: 'error',
+                message: err instanceof Error ? err.message : 'Terjadi kesalahan saat memproses file',
+            });
+        } finally {
+            e.target.value = '';
+        }
+    };
+
+    return (
+        <div className="max-w-2xl mx-auto p-6 space-y-4">
+            <div className="flex gap-4">
+                <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Tahun</label>
+                    <input
+                        type="number"
+                        value={tahun}
+                        onChange={(e) => setTahun(Number(e.target.value))}
+                        className="w-32 border border-gray-300 rounded-lg px-3 py-2 text-sm"
+                    />
+                </div>
+                <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Bulan <span className="text-gray-400 font-normal">(diabaikan jika file berisi banyak sheet)</span>
+                    </label>
+                    <select
+                        value={bulan}
+                        onChange={(e) => setBulan(Number(e.target.value))}
+                        className="w-48 border border-gray-300 rounded-lg px-3 py-2 text-sm"
+                    >
+                        {MONTHS.map((m, i) => (
+                            <option key={i} value={i + 1}>{m}</option>
+                        ))}
+                    </select>
+                </div>
+            </div>
+
+            <label className="flex flex-col items-center justify-center border-2 border-dashed border-gray-300 rounded-xl p-10 cursor-pointer hover:border-emerald-400 transition-colors">
+                <Upload className="w-8 h-8 text-gray-400 mb-2" />
+                <span className="text-sm text-gray-600">
+                    Klik untuk memilih file laporan (.xlsx atau .csv)
+                </span>
+                <input
+                    type="file"
+                    accept=".xlsx,.xls,.csv"
+                    className="hidden"
+                    onChange={handleFileUpload}
+                    disabled={status.type === 'loading'}
+                />
+            </label>
+
+            {status.type === 'loading' && (
+                <div className="flex items-center gap-2 text-sm text-gray-600">
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    {status.message}
+                </div>
+            )}
+
+            {status.type === 'success' && (
+                <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-4 text-sm text-emerald-800 space-y-1">
+                    <div className="flex items-center gap-2 font-medium">
+                        <CheckCircle className="w-4 h-4" />
+                        File berhasil diproses.
+                    </div>
+                    <p>Unit ditemukan: {status.results.unitsFound.join(', ') || '-'}</p>
+                    {status.results.unitsCreated > 0 && <p>Unit baru dibuat: {status.results.unitsCreated}</p>}
+                    <p>Anggota baru: {status.results.anggotaCreated}, anggota cocok: {status.results.anggotaMatched}</p>
+                    <p>Transaksi baru: {status.results.transaksiCreated}, transaksi diperbarui: {status.results.transaksiUpdated}</p>
+                    {status.results.rowErrors.length > 0 && (
+                        <p className="text-amber-700">Baris bermasalah: {status.results.rowErrors.length} (lihat console untuk detail)</p>
+                    )}
+                </div>
+            )}
+
+            {status.type === 'error' && (
+                <div className="flex items-center gap-2 bg-red-50 border border-red-200 rounded-lg p-4 text-sm text-red-700">
+                    <AlertCircle className="w-4 h-4" />
+                    {status.message}
+                </div>
+            )}
+        </div>
+    );
+}
+
+
+===== src\components\UploadLaporanKeuangan.tsx =====
+import { useState } from 'react';
+import { Upload, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
+import * as XLSX from 'xlsx';
+import { supabase } from '../supabaseClient';
+
+const MONTH_MAP: Record<string, number> = {
+    JAN: 1, JANUARI: 1,
+    FEB: 2, FEBRUARI: 2,
+    MAR: 3, MARET: 3,
+    APR: 4, APRIL: 4,
+    MAY: 5, MEI: 5,
+    JUN: 6, JUNI: 6,
+    JUL: 7, JULI: 7,
+    AUG: 8, AGU: 8, AGUS: 8, AGUSTUS: 8,
+    SEP: 9, SEPTEMBER: 9,
+    OCT: 10, OKT: 10, OKTOBER: 10,
+    NOV: 11, NOVEMBER: 11,
+    DEC: 12, DES: 12, DESEMBER: 12,
+};
+
+function cleanName(raw: string): string {
+    return raw.replace(/\s*\([^)]*\)\s*$/, '').trim();
+}
+
+function normalize(name: string): string {
+    return cleanName(name).toUpperCase().replace(/\s+/g, ' ').trim();
+}
+
+interface SectionConfig {
+    label: string;
+    table: string;
+    kind: 'anggota' | 'expense' | 'angsuran' | 'pengambilan' | 'skip';
+}
+
+const SECTIONS: SectionConfig[] = [
+    { label: 'SIMPANAN WAJIB', table: '', kind: 'skip' },
+    { label: 'SIMPANAN POKOK', table: 'simpanan_pokok', kind: 'anggota' },
+    { label: 'SIMPANAN SUKARELA', table: '', kind: 'skip' },
+    { label: 'SIMPANAN KHUSUS', table: 'simpanan_khusus', kind: 'anggota' },
+    { label: 'PROVISI', table: 'provisi', kind: 'anggota' },
+    { label: 'ASURANSI', table: 'asuransi', kind: 'anggota' },
+    { label: 'PINJAMAN', table: 'pinjaman', kind: 'anggota' },
+    { label: 'ANGSURAN POKOK DAN JASA', table: 'angsuran', kind: 'angsuran' },
+    { label: 'OPERASIONAL', table: 'operasional', kind: 'expense' },
+    { label: 'WARUNG', table: 'warung_cleo', kind: 'expense' },
+    { label: 'PENGAMBILAN SIMPANAN', table: 'pengambilan_simpanan', kind: 'pengambilan' },
+];
+
+interface ImportResults {
+    sectionsProcessed: string[];
+    sectionsSkipped: string[];
+    rowsImported: number;
+    unmatchedNames: string[];
+}
+
+type UploadStatus =
+    | { type: 'idle' }
+    | { type: 'loading'; message: string }
+    | { type: 'success'; results: ImportResults }
+    | { type: 'error'; message: string };
+
+export default function UploadLaporanKeuangan() {
+    const [status, setStatus] = useState<UploadStatus>({ type: 'idle' });
+    const [tahun, setTahun] = useState(2025);
+
+    const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+
+        setStatus({ type: 'loading', message: 'Membaca file...' });
+
+        try {
+            const buffer = await file.arrayBuffer();
+            const workbook = XLSX.read(buffer, { type: 'array' });
+            const sheet = workbook.Sheets[workbook.SheetNames[0]];
+            const rows: any[][] = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: null });
+
+            setStatus({ type: 'loading', message: 'Memuat data anggota untuk pencocokan nama...' });
+
+            const { data: anggotaList } = await supabase.from('anggota').select('id, nama');
+            const nameMap = new Map<string, number>();
+            for (const a of anggotaList ?? []) {
+                nameMap.set(normalize(a.nama), a.id);
+            }
+
+            const results: ImportResults = {
+                sectionsProcessed: [],
+                sectionsSkipped: [],
+                rowsImported: 0,
+                unmatchedNames: [],
+            };
+
+            let i = 0;
+            while (i < rows.length) {
+                const cell0 = rows[i][0] != null ? String(rows[i][0]).trim().toUpperCase() : '';
+                const matchedSection = SECTIONS.find((s) => cell0.includes(s.label));
+
+                if (!matchedSection) { i++; continue; }
+
+                if (matchedSection.kind === 'skip') {
+                    results.sectionsSkipped.push(matchedSection.label);
+                    i++;
+                    continue;
+                }
+
+                const headerRow = rows[i + 1] ?? [];
+                const monthCols: Record<number, number> = {};
+                headerRow.forEach((cell: any, idx: number) => {
+                    if (cell == null) return;
+                    const m = MONTH_MAP[String(cell).trim().toUpperCase()];
+                    if (m) monthCols[idx] = m;
+                });
+
+                results.sectionsProcessed.push(matchedSection.label);
+                i += 2;
+
+                while (i < rows.length) {
+                    const row = rows[i];
+                    const nameCell = row[1] != null ? String(row[1]).trim() : '';
+                    if (!nameCell || nameCell.toUpperCase() === 'JUMLAH' || nameCell.toUpperCase() === 'TOTAL') {
+                        i++;
+                        if (nameCell.toUpperCase() === 'TOTAL') break;
+                        if (!nameCell) break;
+                        continue;
+                    }
+
+                    let anggotaId: number | null = null;
+                    if (matchedSection.kind !== 'expense') {
+                        const isTreasurerRow = /^BEND\b/i.test(nameCell);
+                        if (!isTreasurerRow) {
+                            const key = normalize(nameCell);
+                            anggotaId = nameMap.get(key) ?? null;
+                            if (!anggotaId && !results.unmatchedNames.includes(nameCell)) {
+                                results.unmatchedNames.push(nameCell);
+                            }
+                        }
+                    }
+
+                    const tipe = matchedSection.kind === 'pengambilan'
+                        ? (row[2] != null ? String(row[2]).trim() : null)
+                        : null;
+
+                    for (const [colIdx, bulan] of Object.entries(monthCols)) {
+                        const raw = row[Number(colIdx)];
+                        const jumlah = Number(raw);
+                        if (!raw || !jumlah) continue;
+
+                        try {
+                            if (matchedSection.kind === 'expense') {
+                                await supabase.from(matchedSection.table).insert({
+                                    deskripsi: nameCell, bulan, tahun, jumlah,
+                                });
+                            } else if (matchedSection.kind === 'angsuran') {
+                                await supabase.from('angsuran').insert({
+                                    nama_entitas: nameCell, id_anggota: anggotaId, bulan, tahun, jumlah,
+                                });
+                            } else if (matchedSection.kind === 'pengambilan') {
+                                if (!anggotaId) continue;
+                                await supabase.from('pengambilan_simpanan').insert({
+                                    id_anggota: anggotaId, tipe, bulan, tahun, jumlah,
+                                });
+                            } else {
+                                if (!anggotaId) continue;
+                                await supabase.from(matchedSection.table).insert({
+                                    id_anggota: anggotaId, bulan, tahun, jumlah,
+                                });
+                            }
+                            results.rowsImported++;
+                        } catch (err) {
+                            console.error(`Gagal import baris ${nameCell} (${matchedSection.table}):`, err);
+                        }
+                    }
+
+                    i++;
+                }
+            }
+
+            setStatus({ type: 'success', results });
+        } catch (err) {
+            setStatus({
+                type: 'error',
+                message: err instanceof Error ? err.message : 'Terjadi kesalahan saat memproses file',
+            });
+        } finally {
+            e.target.value = '';
+        }
+    };
+
+    return (
+        <div className="max-w-2xl mx-auto p-6 space-y-4">
+            <div>
+                <h2 className="text-lg font-bold text-gray-900">Upload Laporan Keuangan Lengkap</h2>
+                <p className="text-sm text-gray-500 mt-1">
+                    Untuk file "LAPORAN KOPERASI" (simpanan pokok/khusus, provisi, asuransi, pinjaman, angsuran, operasional, warung+cleo, pengambilan simpanan).
+                    Simpanan Wajib &amp; Sukarela dilewati karena sudah tercakup di data potongan bulanan.
+                </p>
+            </div>
+
+            <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Tahun</label>
+                <input
+                    type="number"
+                    value={tahun}
+                    onChange={(e) => setTahun(Number(e.target.value))}
+                    className="w-32 border border-gray-300 rounded-lg px-3 py-2 text-sm"
+                />
+            </div>
+
+            <label className="flex flex-col items-center justify-center border-2 border-dashed border-gray-300 rounded-xl p-10 cursor-pointer hover:border-emerald-400 transition-colors">
+                <Upload className="w-8 h-8 text-gray-400 mb-2" />
+                <span className="text-sm text-gray-600">Klik untuk memilih file laporan keuangan (.xlsx)</span>
+                <input
+                    type="file"
+                    accept=".xlsx,.xls"
+                    className="hidden"
+                    onChange={handleFileUpload}
+                    disabled={status.type === 'loading'}
+                />
+            </label>
+
+            {status.type === 'loading' && (
+                <div className="flex items-center gap-2 text-sm text-gray-600">
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    {status.message}
+                </div>
+            )}
+
+            {status.type === 'success' && (
+                <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-4 text-sm text-emerald-800 space-y-1">
+                    <div className="flex items-center gap-2 font-medium">
+                        <CheckCircle className="w-4 h-4" />
+                        File berhasil diproses.
+                    </div>
+                    <p>Bagian diproses: {status.results.sectionsProcessed.join(', ') || '-'}</p>
+                    <p>Bagian dilewati (sudah tercakup): {status.results.sectionsSkipped.join(', ') || '-'}</p>
+                    <p>Baris berhasil diimpor: {status.results.rowsImported}</p>
+                    {status.results.unmatchedNames.length > 0 && (
+                        <div className="text-amber-700 mt-2">
+                            <p className="font-medium">Nama tidak cocok dengan data anggota ({status.results.unmatchedNames.length}) â€” baris ini DILEWATI, perlu dicocokkan manual:</p>
+                            <ul className="list-disc list-inside">
+                                {status.results.unmatchedNames.map((n) => <li key={n}>{n}</li>)}
+                            </ul>
+                        </div>
+                    )}
+                </div>
+            )}
+
+            {status.type === 'error' && (
+                <div className="flex items-center gap-2 bg-red-50 border border-red-200 rounded-lg p-4 text-sm text-red-700">
+                    <AlertCircle className="w-4 h-4" />
+                    {status.message}
+                </div>
+            )}
+        </div>
+    );
+}
