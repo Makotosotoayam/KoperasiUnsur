@@ -1,0 +1,36 @@
+name: Keep Supabase Active
+
+on:
+  schedule:
+    - cron: '0 2 */4 * *'
+  workflow_dispatch:
+
+jobs:
+  ping-databases:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Ping Koperasi Supabase
+        run: |
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X GET "${{ secrets.SUPABASE_URL }}/rest/v1/keep_alive?select=id&limit=1" \
+            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}")
+
+          echo "Koperasi response status: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" -ne 200 ]; then
+            echo "Koperasi ping failed!"
+            exit 1
+          fi
+
+      - name: Ping Comifuro-Ticket Supabase
+        run: |
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X GET "${{ secrets.COMIFURO_SUPABASE_URL }}/rest/v1/keep_alive?select=id&limit=1" \
+            -H "apikey: ${{ secrets.COMIFURO_SUPABASE_ANON_KEY }}" \
+            -H "Authorization: Bearer ${{ secrets.COMIFURO_SUPABASE_ANON_KEY }}")
+
+          echo "Comifuro-Ticket response status: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" -ne 200 ]; then
+            echo "Comifuro-Ticket ping failed!"
+            exit 1
+          fi
